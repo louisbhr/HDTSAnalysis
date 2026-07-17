@@ -23,9 +23,44 @@ TARGET_IMPORTANCE_SUM = 1.0
 
 # Schwellwerte fuer die verbale Abstufung der Korrektur (auf der 1.0-Skala).
 # Da abs_score ein gewichtetes Mittel der |z|-Abweichungen ist, sind das direkt
-# "durchschnittliche Standardabweichungen". Hier zentral kalibrierbar.
-STEP_THRESHOLD_STRONG = 4.5   # darueber: "sehr deutlich"
-STEP_THRESHOLD_MEDIUM = 2.5   # darueber: "deutlich"
+# "durchschnittliche Standardabweichungen". Empirisch (Validierungsstudie) lag
+# abs_score im Bereich 1.29-2.63, die alten Schwellen 2.5/4.5 feuerten praktisch
+# nie. Neu kalibriert auf ~P75/P97 der erwarteten Verteilung bei normaler Tagesform.
+STEP_THRESHOLD_STRONG = 1.9   # darueber: "sehr deutlich"
+STEP_THRESHOLD_MEDIUM = 1.4   # darueber: "deutlich"
+
+# MAD -> Sigma-Schaetzer. Rohe MAD ist auf einer anderen Skala als eine Standard-
+# abweichung; multipliziert mit 1.4826 wird sie (unter Normalverteilungsannahme)
+# ein konsistenter Schaetzer fuer Sigma. Ohne diesen Faktor liegen individuelle
+# z-Werte (MAD-basiert) um ca. 1.48x ueber den Gold-z-Werten (Std-basiert) - die
+# beiden Referenz-Modi leben sonst auf verschiedenen Skalen.
+MAD_CONSISTENCY = 1.4826
+
+# Totband fuer den Trend-Score in Phase "halten": innerhalb dieser Bandbreite gilt
+# das Timing als stabil, es wird keine Richtung ausgegeben.
+DEADBAND_TREND = 0.5
+
+# Konsistenz-Gate in Phase "halten": eine Richtung wird nur ausgegeben, wenn der
+# Trend-Score einen ausreichend grossen Anteil des Absolut-Scores erklaert
+# (sonst heben sich Einzelabweichungen gegenseitig auf -> "uneinheitlich").
+CONSISTENCY_GATE = 0.6
+
+# Phasengrenze: h_rel = h_previous / h_max. Ab hier gilt der Sprung als Phase
+# "halten" (nahe Bestleistung), sonst "aufbau".
+PHASE_HALTEN_H_REL = 0.9
+
+
+def determine_phase(h_previous, h_max, h_rel_threshold=PHASE_HALTEN_H_REL):
+    """Bestimmt die aktuelle Phase ("aufbau" oder "halten") aus der Flughoehe
+    VOR dem aktuellen Kontakt (h_previous) relativ zur Max-Hoehe (h_max).
+
+    Ohne verwertbare Information (h_previous unbekannt oder h_max <= 0) wird
+    konservativ "aufbau" angenommen (keine Timing-Bewertung, nur Output-Feedback).
+    """
+    if h_previous is None or h_max is None or h_max <= 0 or not np.isfinite(h_previous):
+        return "aufbau"
+    h_rel = h_previous / h_max
+    return "halten" if h_rel >= h_rel_threshold else "aufbau"
 
 
 def _clean_values(values):
