@@ -6,7 +6,13 @@ from scipy.integrate import trapezoid
 
 from importance_utils import (
     normalize_importance, compute_jump_score, step_label, format_debug_table,
+    DEADBAND_TREND, CONSISTENCY_GATE, determine_phase,
 )
+
+# Schwelle fuer die Output-orientierte Ampel in Phase "aufbau": diffI (= Integral(i)
+# - Integral(i-1)) ist am Kontaktende latenzfrei verfuegbar und praediziert den erst
+# beim naechsten Kontakt messbaren Hoehengewinn HG.
+AUFBAU_DIFFI_THRESHOLD = 0.0
 
 
 class JumpAnalyzer:
@@ -14,10 +20,15 @@ class JumpAnalyzer:
     JumpAnalyzer: Verarbeitet die Live-Daten aus Qira, erkennt Spruenge, berechnet Features
     und gibt Coaching-Tipps basierend auf einem individuellen oder globalen Goldstandard.
 
-    NEU: Feature-Importance wird zentral ueber importance_utils auf Summe = 1.0 normiert.
-    Der Score ist damit ein gewichtetes Mittel der absoluten Abweichungen (in Std/MAD)
-    und nicht mehr um Faktor ~4.5 ueberhoeht. Zusaetzlich werden Trend- und Absolut-Score
-    getrennt berechnet und pro Sprung als Debug-Tabelle geloggt.
+    Feature-Importance wird zentral ueber importance_utils auf Summe = 1.0 normiert.
+    Der Score ist damit ein gewichtetes Mittel der absoluten Abweichungen (in Std/MAD).
+
+    NEU: Es werden ZWEI Referenzsaetze ("aufbau"/"halten") pro Athlet geladen. Welcher
+    Modus fuer den aktuellen Kontakt gilt, wird ueber die Flughoehe VOR diesem Kontakt
+    relativ zur Max-Hoehe bestimmt (siehe importance_utils.determine_phase). Die
+    Coaching-Ausgabe ist entsprechend phasenabhaengig: in "halten" wird das Timing
+    gegen die Referenz bewertet (mit Totband + Konsistenz-Gate), in "aufbau" gibt es
+    stattdessen eine output-orientierte Rueckmeldung anhand von diffI.
     """
 
     # ---- 1. Initialisierung ----
@@ -44,26 +55,32 @@ class JumpAnalyzer:
 
         # Dynamische Athleten-Parameter
         self.h_max = 4.5
-        self.var_names = ["Peak", "Peak_t", "Peak_Prct", "timing", "Explosiv",
+
+        # Score-relevante Features. "Peak" wird nie in current_features uebergeben
+        # (totes Feature) und "timing" ist exakt 100*Peak_t (perfekte Kollinearitaet
+        # mit Peak_Prct, doppeltes Gewicht) - beide raus aus dem Score (Validierungsstudie).
+        self.var_names = ["Peak_t", "Peak_Prct", "Explosiv",
         "preSlope", "postSlope", "Symmetry"]
 
-        self.gold_standard_use = None
-        self.gold_dev_use = None
-        self.importance = None
-        self.gold_features_use = np.array(self.var_names)
+        # Alle live berechneten Groessen fuer self.data (inkl. Peak/timing, die weiterhin
+        # berechnet werden, sowie die neuen Ampel-Praediktoren Contact_t/Integral/diffI).
+        self.log_var_names = ["Peak", "Peak_t", "Peak_Prct", "timing", "Explosiv",
+        "preSlope", "postSlope", "Symmetry", "Contact_t", "Integral", "diffI"]
 
-        # Dict-Repraesentationen fuer die zentrale Score-Berechnung.
-        self.reference = {}
-        self.deviation = {}
-        self.importance_dict = {}
+        # Zwei Referenzsaetze (Modi). Struktur je Modus:
+        #   {"reference": {...}, "deviation": {...}, "importance_dict": {...}}
+        self.profiles = {}
+
+        # Integral des zuletzt verarbeiteten Kontakts, fuer diffI = Integral(i) - Integral(i-1).
+        self.last_integral = None
 
         # Korrekturrichtung je Feature (+1: hoeher ist besser, -1: niedriger ist besser).
         self.direction_multiplier = {
-            "Peak_t": 1, "timing": 1, "Peak_Prct": 1,
+            "Peak_t": 1, "Peak_Prct": 1,
             "Symmetry": 1, "postSlope": 1, "preSlope": -1, "Explosiv": -1,
         }
 
-        self.data = {var: [] for var in self.var_names}
+        self.data = {var: [] for var in self.log_var_names}
         self.data["coaching"] = []
 
         # Filter initialisieren
@@ -72,65 +89,96 @@ class JumpAnalyzer:
 
         self.load_profile("global")
 
-    # ---- 1b. Dict-Repraesentationen aus den Arrays aufbauen ----
-    def _build_lookup_dicts(self):
-        """Baut reference/deviation/importance_dict aus den geladenen Arrays.
+    # ---- 1b. Ein einzelnes Referenz-Set (Modus) aus Median/MAD/Importance-Series bauen ----
+    def _build_mode_dict(self, medians, mads, importances):
+        """Baut ein {"reference","deviation","importance_dict"}-Dict fuer einen Modus.
 
         Die Importance wird hier zentral auf Summe = 1.0 normiert (eine einzige Stelle).
         """
-        self.reference = {var: float(self.gold_standard_use[i]) for i, var in enumerate(self.var_names)}
-        self.deviation = {var: float(self.gold_dev_use[i]) for i, var in enumerate(self.var_names)}
+        reference = {var: float(medians[var]) for var in self.var_names}
+        deviation = {var: float(mads[var]) for var in self.var_names}
+        raw_imp = {var: float(importances[var]) for var in self.var_names}
+        importance_dict = normalize_importance(raw_imp, feature_names=self.var_names, target_sum=1.0)
+        return {"reference": reference, "deviation": deviation, "importance_dict": importance_dict}
 
-        raw_imp = {var: float(self.importance[i]) for i, var in enumerate(self.var_names)}
-        self.importance_dict = normalize_importance(raw_imp, feature_names=self.var_names, target_sum=1.0)
-        # importance-Array konsistent auf 1.0-Skala zuruecksetzen.
-        self.importance = np.array([self.importance_dict[var] for var in self.var_names])
-
-    # ---- 2. Profil laden ----
-    def load_profile(self, athlet_name, logFcn=print):
-        """Laedt das individuelle Baseline-Profil oder weicht auf den Goldstandard aus.
-
-        In ALLEN Faellen wird die Importance am Ende zentral auf Summe = 1.0 normiert.
-        """
-        baseline_path = os.path.join("athleten_daten", f"{athlet_name}_baseline.csv")
-
-        if athlet_name not in ["master_session_daten", "global"] and os.path.exists(baseline_path):
-            try:
-                df_base = pd.read_csv(baseline_path).set_index("Feature")
-                df_ordered = df_base.reindex(self.var_names)
-
-                self.gold_standard_use = df_ordered["Median"].values
-                self.gold_dev_use = df_ordered["MAD"].values
-                self.importance = df_ordered["Importance"].values
-                self.h_max = float(df_ordered["H_Max"].iloc[0])
-
-                self._build_lookup_dicts()
-                logFcn(f"JumpAnalyzer: Individuelle Baseline fuer '{athlet_name}' geladen "
-                f"(H_Max: {self.h_max:.2f}m, Importance-Summe normiert auf 1.0).")
-                return
-            except Exception as e:
-                logFcn(f"JumpAnalyzer: Fehler beim Laden der Baseline von {athlet_name}. "
-                f"Weiche auf Goldstandard aus. Fehler: {e}")
-
-        # Fallback: globaler Goldstandard
-        self.h_max = 4.5
+    def _gold_mode(self, logFcn=print):
+        """Laedt den globalen Goldstandard als Fallback-Modus (identisch fuer beide Phasen)."""
         try:
             gold = pd.read_excel("goldTableNeu.xlsx").set_index("Feature")
             gold_ordered = gold.reindex(self.var_names)
-
-            self.gold_standard_use = gold_ordered["GoldMean"].values
-            self.gold_dev_use = gold_ordered["GoldStd"].values
-            self.importance = gold_ordered["Importance"].values
-
-            self._build_lookup_dicts()
-            logFcn("JumpAnalyzer: Globalen Profi-Goldstandard geladen (Importance-Summe normiert auf 1.0).")
+            mode = self._build_mode_dict(
+                gold_ordered["GoldMean"], gold_ordered["GoldStd"], gold_ordered["Importance"])
+            return mode, 4.5
         except Exception as e:
-            # Hardcoded Not-Fallback (Reihenfolge identisch zu self.var_names)
-            self.gold_standard_use = np.array([3000, 0.2, 50, 10, 15000, 50000, -50000, 1.0], dtype=float)
-            self.gold_dev_use = np.array([300, 0.02, 5, 1.5, 2000, 8000, 8000, 0.1], dtype=float)
-            self.importance = np.full(8, 1.0, dtype=float)
-            self._build_lookup_dicts()
             logFcn(f"JumpAnalyzer: KRITISCHER FEHLER beim Excel-Laden. Lokaler Not-Fallback aktiv! {e}")
+            medians = {"Peak_t": 0.2, "Peak_Prct": 50, "Explosiv": 15000,
+                       "preSlope": 50000, "postSlope": -50000, "Symmetry": 1.0}
+            mads = {"Peak_t": 0.02, "Peak_Prct": 5, "Explosiv": 2000,
+                    "preSlope": 8000, "postSlope": 8000, "Symmetry": 0.1}
+            importances = {var: 1.0 for var in self.var_names}
+            mode = self._build_mode_dict(medians, mads, importances)
+            return mode, 4.5
+
+    # ---- 2. Profil laden ----
+    def load_profile(self, athlet_name, logFcn=print):
+        """Laedt das individuelle Baseline-Profil (zwei Modi: "aufbau"/"halten") oder
+        weicht auf den globalen Goldstandard aus.
+
+        Baseline-CSV-Format: Spalte "Mode" ("aufbau"/"halten"), pro Modus eine Zeile
+        je Feature. Alte Baseline-CSVs ohne "Mode"-Spalte werden aus Rueckwaerts-
+        kompatibilitaet als "halten" interpretiert (mit Log-Hinweis auf Neuberechnung);
+        der Modus "aufbau" weicht in diesem Fall auf den Goldstandard aus.
+        """
+        baseline_path = os.path.join("athleten_daten", f"{athlet_name}_baseline.csv")
+        profiles = {}
+        mode_sources = {}
+        h_max = None
+
+        if athlet_name not in ["master_session_daten", "global"] and os.path.exists(baseline_path):
+            try:
+                df_base = pd.read_csv(baseline_path)
+                if "Mode" not in df_base.columns:
+                    logFcn(f"JumpAnalyzer: Baseline fuer '{athlet_name}' im alten Format (ohne "
+                    f"'Mode'-Spalte) gefunden - wird als Modus 'halten' interpretiert. "
+                    f"Baseline sollte neu berechnet werden (Athleten-Baseline aktualisieren).")
+                    df_base = df_base.copy()
+                    df_base["Mode"] = "halten"
+
+                for mode in ("aufbau", "halten"):
+                    df_mode = df_base[df_base["Mode"] == mode]
+                    if df_mode.empty:
+                        continue
+                    df_mode = df_mode.set_index("Feature").reindex(self.var_names)
+                    if df_mode["Median"].notna().any():
+                        profiles[mode] = self._build_mode_dict(
+                            df_mode["Median"].fillna(0.0),
+                            df_mode["MAD"].fillna(1.0),
+                            df_mode["Importance"].fillna(0.0),
+                        )
+                        mode_sources[mode] = "individuelle Baseline"
+                        h_max_vals = df_mode["H_Max"].dropna()
+                        if len(h_max_vals) > 0 and h_max is None:
+                            h_max = float(h_max_vals.iloc[0])
+            except Exception as e:
+                logFcn(f"JumpAnalyzer: Fehler beim Laden der Baseline von {athlet_name}. "
+                f"Weiche auf Goldstandard aus. Fehler: {e}")
+                profiles, mode_sources = {}, {}
+
+        if "aufbau" not in profiles or "halten" not in profiles:
+            gold_profile, gold_h_max = self._gold_mode(logFcn)
+            for mode in ("aufbau", "halten"):
+                if mode not in profiles:
+                    profiles[mode] = gold_profile
+                    mode_sources[mode] = "Goldstandard"
+            if h_max is None:
+                h_max = gold_h_max
+
+        self.profiles = profiles
+        self.h_max = h_max if h_max is not None else 4.5
+
+        logFcn(f"JumpAnalyzer: Profil fuer '{athlet_name}' geladen "
+        f"(aufbau: {mode_sources.get('aufbau', '?')}, halten: {mode_sources.get('halten', '?')}, "
+        f"H_Max: {self.h_max:.2f}m, Importance-Summe je Modus normiert auf 1.0).")
 
     # ---- 3. Kontaktgrenzen fuer einen Peak ----
     def _calculate_contact_bounds_for_peak(self, i, signal_array):
@@ -170,6 +218,20 @@ class JumpAnalyzer:
         if not np.isnan(x_interp_l) and not np.isnan(x_interp_r) and x_interp_r > x_interp_l:
             return x_interp_l, x_interp_r
         return None, None
+
+    # ---- 3b. Flughoehe VOR dem aktuellen Kontakt (fuer die Phasen-Weiche) ----
+    def _h_previous_for_jump(self, next_jump_idx, left):
+        """Schaetzt die Flughoehe des Flugs, der in den aktuellen Kontakt fuehrt.
+
+        Verallgemeinerte Form der frueheren High-Performance-Zone-Berechnung.
+        Liefert None, wenn kein gueltiger vorheriger Kontakt bekannt ist.
+        """
+        if next_jump_idx > 0 and self.right_idx[next_jump_idx - 1] is not None:
+            letztes_kontakt_ende = self.right_idx[next_jump_idx - 1]
+            if left > letztes_kontakt_ende:
+                t_flug = (left - letztes_kontakt_ende) / self.fs_file
+                return 0.125 * self.g * (t_flug ** 2)
+        return None
 
     # ---- 4. Hauptfunktion: Verarbeitung der Daten aus Qira ----
     def process(self, d, block_id, logFcn=print):
@@ -286,6 +348,11 @@ class JumpAnalyzer:
             post_integral = trapezoid(F_post, t_post)
             sym = np.nan if abs(post_integral) < 1e-4 else pre_integral / post_integral
 
+            # Integral ueber den GESAMTEN Kontakt + diffI (latenzfreier Praediktor fuer HG).
+            integral_full = trapezoid(jump, t_seg)
+            diffI = np.nan if self.last_integral is None else integral_full - self.last_integral
+            self.last_integral = integral_full
+
             self.data["Peak"].append(peak)
             self.data["Peak_t"].append(peak_t)
             self.data["Peak_Prct"].append(peak_prct)
@@ -294,62 +361,71 @@ class JumpAnalyzer:
             self.data["preSlope"].append(pre_slope)
             self.data["postSlope"].append(post_slope)
             self.data["Symmetry"].append(sym)
+            self.data["Contact_t"].append(contact_t)
+            self.data["Integral"].append(integral_full)
+            self.data["diffI"].append(diffI)
 
-            # ~ 4.4 Coaching-Logik ~
-            z_threshold_limit = 1.5
-
-            # High-Performance-Zone: Toleranz erweitern, wenn vorheriger Flug nahe Bestleistung war.
-            if next_jump_idx > 0 and self.right_idx[next_jump_idx - 1] is not None:
-                letztes_kontakt_ende = self.right_idx[next_jump_idx - 1]
-                if left > letztes_kontakt_ende:
-                    t_flug = (left - letztes_kontakt_ende) / self.fs_file
-                    h_previous = 0.125 * self.g * (t_flug ** 2)
-                    if self.h_max > 0:
-                        prozent_von_max = (h_previous / self.h_max) * 100
-                        if prozent_von_max > 90.0:
-                            z_threshold_limit = 2.5
-                            logFcn(f"High-Performance-Zone detektiert "
-                            f"({prozent_von_max:.1f}% von Max-Hoehe, h={h_previous:.2f}m).")
+            # ~ 4.4 Phasen-Weiche + Coaching-Logik ~
+            h_previous = self._h_previous_for_jump(next_jump_idx, left)
+            phase = determine_phase(h_previous, self.h_max)
+            if h_previous is not None:
+                logFcn(f"Phase '{phase}' (h_previous={h_previous:.2f}m, H_Max={self.h_max:.2f}m).")
 
             current_features = {
-                "Peak_t": peak_t, "Peak_Prct": peak_prct, "timing": timing,
-                "Explosiv": explosiv,
+                "Peak_t": peak_t, "Peak_Prct": peak_prct, "Explosiv": explosiv,
                 "preSlope": pre_slope, "postSlope": post_slope, "Symmetry": sym,
             }
 
+            mode_profile = self.profiles.get(phase, self.profiles.get("halten"))
+
             # ZENTRALE Score-Berechnung (Importance intern auf Summe = 1.0 normiert).
+            # Wird in BEIDEN Phasen berechnet und geloggt (fuer spaetere Analysen),
+            # auch wenn die Coaching-AUSGABE in "aufbau" nicht timing-basiert ist.
             result = compute_jump_score(
                 current_features=current_features,
-                reference=self.reference,
-                deviation=self.deviation,
-                importance=self.importance_dict,
+                reference=mode_profile["reference"],
+                deviation=mode_profile["deviation"],
+                importance=mode_profile["importance_dict"],
                 direction=self.direction_multiplier,
                 feature_order=self.var_names,
             )
 
             trend_score = result["trend_score"]   # mit Richtung (+ = "frueher treten")
             abs_score = result["abs_score"]        # reine Abweichung, gewichtetes Mittel der |z|
-            max_abs_delta = result["max_abs_delta"]
-
-            step = step_label(abs_score)
-            direction = "frueher treten" if trend_score > 0 else "spaeter treten"
-            coaching_output = f"Athlet muss {step} {direction}"
 
             self.total_jump_count += 1
+
+            if phase == "halten":
+                if abs(trend_score) < DEADBAND_TREND:
+                    coaching_output = "Timing stabil - gut!"
+                    logFcn(f"Sprung #{self.total_jump_count} erkannt! [halten] {coaching_output} "
+                    f"(Trend-Score: {trend_score:+.3f}, Absolut-Score: {abs_score:.3f})")
+                else:
+                    consistency = (abs(trend_score) / abs_score) if abs_score > 0.0 else 0.0
+                    if consistency > CONSISTENCY_GATE:
+                        step = step_label(abs_score)
+                        direction_txt = "frueher treten" if trend_score > 0 else "spaeter treten"
+                        coaching_output = f"Athlet muss {step} {direction_txt}"
+                        logFcn(f"Sprung #{self.total_jump_count} erkannt! [halten] Coaching: {coaching_output}\n"
+                        f"   Trend-Score (mit Richtung): {trend_score:+.3f} | "
+                        f"Absolut-Score (Abweichung): {abs_score:.3f} | Konsistenz: {consistency:.2f}")
+                    else:
+                        coaching_output = "Abweichung uneinheitlich"
+                        debug_table = format_debug_table(result["details"])
+                        logFcn(f"Sprung #{self.total_jump_count} erkannt! [halten] {coaching_output}\n"
+                        f"   Trend-Score (mit Richtung): {trend_score:+.3f} | "
+                        f"Absolut-Score (Abweichung): {abs_score:.3f} | Konsistenz: {consistency:.2f}\n{debug_table}")
+            else:  # phase == "aufbau": keine Timing-Bewertung, output-orientierte Rueckmeldung.
+                if not np.isfinite(diffI):
+                    coaching_output = "Erster Sprung erfasst - weiter so!"
+                elif diffI > AUFBAU_DIFFI_THRESHOLD:
+                    coaching_output = "Guter Druck - Hoehe kommt!"
+                else:
+                    coaching_output = "Mehr Druck ins Tuch"
+                logFcn(f"Sprung #{self.total_jump_count} erkannt! [aufbau] {coaching_output} "
+                f"(diffI: {diffI:.1f}, Score nur geloggt - Trend: {trend_score:+.3f}, Abs: {abs_score:.3f})")
+
             self.data["coaching"].append(coaching_output)
-
-            if abs_score > z_threshold_limit:
-                debug_table = format_debug_table(result["details"])
-                logFcn(
-                    f"Sprung #{self.total_jump_count} erkannt! Coaching: {coaching_output}\n"
-                    f"   Trend-Score (mit Richtung): {trend_score:+.3f} | "
-                    f"Absolut-Score (Abweichung): {abs_score:.3f} | "
-                    f"max |z|: {max_abs_delta:.2f}\n{debug_table}"
-                )
-            else:
-                logFcn(f"Sprung #{self.total_jump_count} erkannt! Alle Werte im gruenen Bereich. "
-                f"Gut gemacht! (Absolut-Score: {abs_score:.3f})")
-
             self.last_analyzed_jump_idx = next_jump_idx
 
     def reset(self):
@@ -362,6 +438,7 @@ class JumpAnalyzer:
         self.n_jumps = 0
         self.total_jump_count = 0
         self.last_analyzed_jump_idx = -1
+        self.last_integral = None
         self.zi = lfilter_zi(self.b, self.a)
-        self.data = {var: [] for var in self.var_names}
+        self.data = {var: [] for var in self.log_var_names}
         self.data["coaching"] = []
