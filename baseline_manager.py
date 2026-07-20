@@ -9,8 +9,13 @@ from profiler import HG_QUALITY_THRESHOLD
 # Score-relevante Features (identisch zu profiler.SCORE_VAR_NAMES / jump_analyzer.var_names).
 VAR_NAMES = ["Peak_t", "Peak_Prct", "Explosiv", "preSlope", "postSlope", "Symmetry"]
 
-# Mindestanzahl Spruenge pro Modus, sonst faellt dieser Modus komplett auf den
-# Goldstandard zurueck (Median/MAD/Importance).
+# Mindestanzahl Spruenge pro Modus. Unterschreitung:
+#   * "halten": Fallback auf den Goldstandard (Median/MAD/Importance)
+#   * "aufbau": KEIN Fallback - es werden keine Aufbau-Zeilen gespeichert.
+#     Der Goldstandard beschreibt Steady-State-Kontakte und waere als
+#     Aufbau-Referenz genau falsch; die Ampel faehrt dann im Aufbau nur das
+#     diffI-Kriterium (siehe esp_client.classify_ampel), Richtungslichter
+#     erst, sobald die Aufbau-Baseline steht.
 MIN_JUMPS_PER_MODE = 15
 
 # H_Max_robust = dieses Perzentil der Height-Spalte (statt max(), damit ein einzelner
@@ -158,6 +163,15 @@ def update_athlete_baseline(athlet_name, gold_standard_path="goldTableNeu.xlsx")
         hg_avg = float(df_mode["HG"].mean()) if (mode_n > 0 and "HG" in df_mode.columns) else float("nan")
 
         if mode_n < MIN_JUMPS_PER_MODE:
+            if mode == "aufbau":
+                # Bewusst KEIN Goldstandard-Fallback: Steady-State-Werte waeren als
+                # Aufbau-Referenz genau falsch. Ohne gespeicherte Aufbau-Zeilen
+                # erkennt der Loader den Modus als fehlend -> Ampel nutzt im Aufbau
+                # nur das diffI-Kriterium.
+                modus_texts.append(f"aufbau: nur {mode_n} Spruenge "
+                                    f"(<{MIN_JUMPS_PER_MODE}) - kein Referenzsatz gespeichert, "
+                                    f"Ampel faehrt im Aufbau nur diffI")
+                continue
             medians, mads, importances_raw = _gold_fallback_row_values(gold_standard_path, VAR_NAMES)
             modus_texts.append(f"{mode}: Goldstandard-Fallback ({mode_n} Spruenge, "
                                 f"<{MIN_JUMPS_PER_MODE} benoetigt)")
