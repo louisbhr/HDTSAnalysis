@@ -40,6 +40,9 @@ AMPEL_STATUS_CONNECTED = "color: #00E676; font-weight: bold;"
 # Ein Signal-Verteiler, um Thread-Sicherheit fuer die GUI zu garantieren
 class SignalBridge(QObject):
     log_signal = pyqtSignal(str)
+    # Tatsaechlicher Qira-Verbindungsstatus (True=verbunden, False=getrennt/fehlgeschlagen).
+    # Kommt aus dem Websocket-Thread und muss in den GUI-Thread gehoben werden.
+    qira_connection_signal = pyqtSignal(bool)
     # Ampel-Ereignisse kommen aus dem Reader-Thread des AmpelClient und muessen
     # ueber Signale in den GUI-Thread gehoben werden.
     ampel_conn_signal = pyqtSignal(bool)
@@ -57,9 +60,13 @@ class MainWindow(QMainWindow):
         # ---- 1. Signal-Bridge ----
         self.bridge = SignalBridge()
         self.bridge.log_signal.connect(self.log_message)
+        self.bridge.qira_connection_signal.connect(self.on_qira_connection_changed)
 
         # ---- 2. Qira-Client und JumpAnalyzer ----
-        self.client = QiraClient(url="ws://localhost:8081", logFcn=self.bridge.log_signal.emit)
+        self._qira_connected = False
+        self.client = QiraClient(
+            url="ws://localhost:8081", logFcn=self.bridge.log_signal.emit,
+            on_connection_changed=self.bridge.qira_connection_signal.emit)
         self.analyzer = JumpAnalyzer()
 
         # ---- 2b. Ampel-Client (ESP32) ----
@@ -310,7 +317,37 @@ class MainWindow(QMainWindow):
 
     # ---- 7. Verbindungslogik ----
     def start_connection(self):
-        if "trennen" not in self.btn_connect.text().lower():
+        """Startet bzw. trennt die Qira-Verbindung.
+
+        Der Button wird NICHT mehr optimistisch umgeschaltet, sondern erst,
+        wenn der Websocket den echten Verbindungsstatus meldet
+        (on_qira_connection_changed via SignalBridge).
+        """
+        if not self._qira_connected:
+            try:
+                self.client = QiraClient(
+                    url="ws://localhost:8081", logFcn=self.bridge.log_signal.emit,
+                    on_connection_changed=self.bridge.qira_connection_signal.emit)
+                # Bereits getroffene Trampolin-Auswahl auf den neuen Client uebertragen.
+                if self.selected_trampoline is not None:
+                    self.client.set_trampoline(self.selected_trampoline)
+            except Exception as e:
+                self.log_message(f"Fehler beim Re-Initialisieren des Clients: {e}")
+                return
+
+            self.client.connect()
+        else:
+            if hasattr(self.client, 'ws') and self.client.ws:
+                try:
+                    self.client.ws.close()
+                except Exception as e:
+                    self.log_message(f"Fehler beim Schliessen des Sockets: {e}")
+
+    # ---- 7b. Qira: Verbindungsstatus-Callback (via SignalBridge im GUI-Thread) ----
+    def on_qira_connection_changed(self, connected):
+        """Schaltet den Verbinden-Button anhand des ECHTEN Verbindungsstatus um."""
+        self._qira_connected = connected
+        if connected:
             self.btn_connect.setStyleSheet(
                 "background-color: #FF3B30; color: white; font-weight: bold; "
                 "border-radius: 6px; padding: 10px;")
@@ -320,27 +357,11 @@ class MainWindow(QMainWindow):
                 options=[{"color": "white", "scale_factor": 1.0},
                 {"color": "white", "scale_factor": 1.5}])
             self.btn_connect.setIcon(disconnect_icon)
-
-            try:
-                self.client = QiraClient(url="ws://localhost:8081", logFcn=self.bridge.log_signal.emit)
-                # Bereits getroffene Trampolin-Auswahl auf den neuen Client uebertragen.
-                if self.selected_trampoline is not None:
-                    self.client.set_trampoline(self.selected_trampoline)
-            except Exception as e:
-                self.log_message(f"Fehler beim Re-Initialisieren des Clients: {e}")
-
-            self.client.connect()
         else:
             self.btn_connect.setStyleSheet("")
             self.btn_connect.setText("Mit Qira verbinden")
             self.btn_connect.setIcon(qta.icon("msc.link", color="white"))
             self.btn_connect.setIconSize(QSize(20, 20))
-
-            if hasattr(self.client, 'ws') and self.client.ws:
-                try:
-                    self.client.ws.close()
-                except Exception as e:
-                    self.log_message(f"Fehler beim Schliessen des Sockets: {e}")
 
     # ---- 8. Analyse-Start/Stop ----
     def start_analysis(self):

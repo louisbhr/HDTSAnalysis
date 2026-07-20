@@ -21,10 +21,15 @@ class QiraClient:
     """
 
     # ---- 1. Initialisierung ----
-    def __init__(self, url, logFcn=print):
+    def __init__(self, url, logFcn=print, on_connection_changed=None):
         self.url = url
         self.logFcn = logFcn
         self.data_queue = queue.Queue()
+
+        # Optionaler Callback fuer den TATSAECHLICHEN Verbindungsstatus
+        # (True = verbunden, False = getrennt/fehlgeschlagen). Wird von der GUI
+        # genutzt, um den Verbinden-Button erst bei echter Verbindung umzuschalten.
+        self.on_connection_changed = on_connection_changed
 
         # blockID zeigt an, ob neue Daten da sind.
         self.blockID = 0
@@ -69,9 +74,24 @@ class QiraClient:
         self.thread.start()
         self.logFcn("Verbindungsversuch gestartet...")
 
+    # ---- 2b. Verbindungsstatus an die GUI melden ----
+    def _notify_connection(self, connected):
+        """Meldet den echten Verbindungsstatus an den optionalen Callback.
+
+        Der Callback laeuft im Websocket-Thread - die GUI muss ihn selbst
+        ueber eine SignalBridge in den GUI-Thread heben.
+        """
+        if self.on_connection_changed is None:
+            return
+        try:
+            self.on_connection_changed(connected)
+        except Exception as e:
+            self.logFcn(f"QiraClient: Fehler im Verbindungsstatus-Callback: {e}")
+
     # ---- 3. Callback: Verbindung geoeffnet ----
     def on_open(self, ws):
         self.logFcn("Qira ist verbunden. Bereit fuer Analyse...")
+        self._notify_connection(True)
 
     # ---- 4. Callback: Textnachricht empfangen ----
     def on_text_message(self, ws, message):
@@ -112,7 +132,9 @@ class QiraClient:
     # ---- 5. Callback: Fehler ----
     def on_error(self, ws, error):
         self.logFcn(f"Websocket Fehler: {error}")
+        self._notify_connection(False)
 
     # ---- 6. Callback: Verbindung geschlossen ----
     def on_close(self, ws, close_status_code, close_msg):
         self.logFcn(f"Verbindung zu Qira geschlossen: {close_msg}")
+        self._notify_connection(False)
