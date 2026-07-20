@@ -9,6 +9,12 @@ from importance_utils import (
     DEADBAND_TREND, CONSISTENCY_GATE, determine_phase,
 )
 
+# Ampel-Zuordnung (ESP32): optional - der Analyzer laeuft auch ohne esp_client.
+try:
+    from esp_client import classify_ampel
+except Exception:
+    classify_ampel = None
+
 # Schwelle fuer die Output-orientierte Ampel in Phase "aufbau": diffI (= Integral(i)
 # - Integral(i-1)) ist am Kontaktende latenzfrei verfuegbar und praediziert den erst
 # beim naechsten Kontakt messbaren Hoehengewinn HG.
@@ -70,6 +76,13 @@ class JumpAnalyzer:
         # Zwei Referenzsaetze (Modi). Struktur je Modus:
         #   {"reference": {...}, "deviation": {...}, "importance_dict": {...}}
         self.profiles = {}
+        # Herkunft je Modus ("individuelle Baseline" | "Goldstandard") - steuert
+        # u.a., ob die Ampel im Aufbau Richtungslichter zeigen darf.
+        self.mode_sources = {}
+
+        # Optionale ESP32-Ampel: wird von der GUI per set_ampel_client() gesetzt.
+        self.ampel_client = None
+        self.last_ampel_state = ("OFF", 0)
 
         # Integral des zuletzt verarbeiteten Kontakts, fuer diffI = Integral(i) - Integral(i-1).
         self.last_integral = None
@@ -174,11 +187,22 @@ class JumpAnalyzer:
                 h_max = gold_h_max
 
         self.profiles = profiles
+        self.mode_sources = dict(mode_sources)
         self.h_max = h_max if h_max is not None else 4.5
 
         logFcn(f"JumpAnalyzer: Profil fuer '{athlet_name}' geladen "
         f"(aufbau: {mode_sources.get('aufbau', '?')}, halten: {mode_sources.get('halten', '?')}, "
         f"H_Max: {self.h_max:.2f}m, Importance-Summe je Modus normiert auf 1.0).")
+
+    # ---- 2b. Ampel (ESP32) anbinden ----
+    def set_ampel_client(self, client):
+        """Setzt (oder entfernt, mit None) den AmpelClient aus esp_client.py.
+
+        Der Analyzer sendet dann nach jedem Sprung den phasenabhaengigen
+        Ampel-Zustand. Ohne Client wird der Zustand trotzdem berechnet und in
+        self.last_ampel_state abgelegt (fuer GUI/Debug).
+        """
+        self.ampel_client = client
 
     # ---- 3. Kontaktgrenzen fuer einen Peak ----
     def _calculate_contact_bounds_for_peak(self, i, signal_array):
@@ -426,6 +450,22 @@ class JumpAnalyzer:
                 f"(diffI: {diffI:.1f}, Score nur geloggt - Trend: {trend_score:+.3f}, Abs: {abs_score:.3f})")
 
             self.data["coaching"].append(coaching_output)
+
+            # ~ 4.5 Ampel (ESP32): Zustand aus derselben phasenabhaengigen Logik ~
+            if classify_ampel is not None:
+                # Richtungslichter im Aufbau nur gegen eine INDIVIDUELLE
+                # Aufbau-Baseline (Goldstandard = Steady-State waere dort falsch).
+                aufbau_ok = (self.mode_sources.get("aufbau") == "individuelle Baseline")
+                self.last_ampel_state = classify_ampel(
+                    trend_score, abs_score, phase=phase, diffI=diffI,
+                    aufbau_reference_ok=aufbau_ok)
+                if self.ampel_client is not None:
+                    led_direction, led_level = self.last_ampel_state
+                    try:
+                        self.ampel_client.send_state(led_direction, led_level)
+                    except Exception as e:
+                        logFcn(f"Ampel: Sendefehler aus dem Analyzer ({e}).")
+
             self.last_analyzed_jump_idx = next_jump_idx
 
     def reset(self):
@@ -439,6 +479,7 @@ class JumpAnalyzer:
         self.total_jump_count = 0
         self.last_analyzed_jump_idx = -1
         self.last_integral = None
+        self.last_ampel_state = ("OFF", 0)
         self.zi = lfilter_zi(self.b, self.a)
         self.data = {var: [] for var in self.log_var_names}
         self.data["coaching"] = []
