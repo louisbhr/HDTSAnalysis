@@ -9,12 +9,14 @@ from PyQt6.QtCore import QTimer, QObject, pyqtSignal, QSize, Qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget,
     QFrame, QComboBox, QInputDialog, QMessageBox, QHBoxLayout, QLabel, QFileDialog,
+    QLineEdit,
 )
 from PyQt6.QtGui import QIcon
 
 # Klassen-Imports
 from jump_analyzer import JumpAnalyzer
 from qira_client import QiraClient
+from esp_client import AmpelClient, DEFAULT_WIFI_HOST
 from profiler import run_offline_profiler, ALL_COLUMNS, BASELINE_COLUMNS
 from baseline_manager import update_athlete_baseline
 import session_storage
@@ -30,9 +32,18 @@ TRAMPOLIN_STYLE_ACTIVE = (
 )
 
 
+# Stil fuer den Ampel-Status ("Getrennt" rot, "Verbunden" gruen).
+AMPEL_STATUS_DISCONNECTED = "color: #FF3B30; font-weight: bold;"
+AMPEL_STATUS_CONNECTED = "color: #00E676; font-weight: bold;"
+
+
 # Ein Signal-Verteiler, um Thread-Sicherheit fuer die GUI zu garantieren
 class SignalBridge(QObject):
     log_signal = pyqtSignal(str)
+    # Ampel-Ereignisse kommen aus dem Reader-Thread des AmpelClient und muessen
+    # ueber Signale in den GUI-Thread gehoben werden.
+    ampel_conn_signal = pyqtSignal(bool)
+    ampel_power_signal = pyqtSignal(bool)
 
 
 class MainWindow(QMainWindow):
@@ -51,6 +62,20 @@ class MainWindow(QMainWindow):
         self.client = QiraClient(url="ws://localhost:8081", logFcn=self.bridge.log_signal.emit)
         self.analyzer = JumpAnalyzer()
 
+        # ---- 2b. Ampel-Client (ESP32) ----
+        self.bridge.ampel_conn_signal.connect(self.on_ampel_connection_changed)
+        self.bridge.ampel_power_signal.connect(self.on_ampel_power_changed)
+        self.ampel = AmpelClient(
+            log_fcn=self.bridge.log_signal.emit,
+            on_connection_changed=self.bridge.ampel_conn_signal.emit,
+            on_power_changed=self.bridge.ampel_power_signal.emit,
+        )
+        # Analyzer sendet nach jedem Sprung den Ampel-Zustand; ohne Verbindung
+        # sind die Sendeaufrufe im AmpelClient wirkungslos (kein Fehler).
+        self.analyzer.set_ampel_client(self.ampel)
+        # Transportweg der Ampel ("USB" / "WLAN")
+        self.ampel_mode = "USB"
+
         self.gui_last_block_id = -1
         self.midterm_storage = []
 
@@ -66,6 +91,67 @@ class MainWindow(QMainWindow):
         self.btn_connect.setIconSize(QSize(20, 20))
         self.btn_connect.clicked.connect(self.start_connection)
         layout.addWidget(self.btn_connect)
+
+        # ---- Ampel (ESP32) Panel ----
+        ampel_panel = QFrame()
+        ampel_panel.setObjectName("athletPanel")
+        ampel_layout = QVBoxLayout(ampel_panel)
+        ampel_layout.setContentsMargins(20, 16, 20, 20)
+        ampel_layout.setSpacing(12)
+
+        lbl_ampel = QLabel("Ampel (ESP32)")
+        lbl_ampel.setObjectName("sectionTitle")
+        ampel_layout.addWidget(lbl_ampel)
+
+        # Transport-Umschalter USB / WLAN (nur im getrennten Zustand umschaltbar).
+        ampel_mode_row = QHBoxLayout()
+        ampel_mode_row.setSpacing(12)
+        self.btn_ampel_usb = QPushButton("USB")
+        self.btn_ampel_wifi = QPushButton("WLAN")
+        self.btn_ampel_usb.setStyleSheet(TRAMPOLIN_STYLE_ACTIVE)
+        self.btn_ampel_wifi.setStyleSheet(TRAMPOLIN_STYLE_INACTIVE)
+        self.btn_ampel_usb.clicked.connect(lambda: self.select_ampel_mode("USB"))
+        self.btn_ampel_wifi.clicked.connect(lambda: self.select_ampel_mode("WLAN"))
+        ampel_mode_row.addWidget(self.btn_ampel_usb)
+        ampel_mode_row.addWidget(self.btn_ampel_wifi)
+        ampel_layout.addLayout(ampel_mode_row)
+
+        # USB-Zeile: COM-Port-Auswahl + Aktualisieren
+        self.ampel_usb_row = QWidget()
+        usb_row_layout = QHBoxLayout(self.ampel_usb_row)
+        usb_row_layout.setContentsMargins(0, 0, 0, 0)
+        usb_row_layout.setSpacing(12)
+        self.dropdown_ampel_port = QComboBox()
+        self.dropdown_ampel_port.setObjectName("athletDropdown")
+        self.btn_ampel_refresh = QPushButton("Aktualisieren")
+        self.btn_ampel_refresh.clicked.connect(self.refresh_ampel_ports)
+        usb_row_layout.addWidget(self.dropdown_ampel_port, stretch=7)
+        usb_row_layout.addWidget(self.btn_ampel_refresh, stretch=3)
+        ampel_layout.addWidget(self.ampel_usb_row)
+
+        # WLAN-Zeile: IP-Feld (Standard: Access-Point-IP der Firmware)
+        self.ampel_wifi_row = QWidget()
+        wifi_row_layout = QHBoxLayout(self.ampel_wifi_row)
+        wifi_row_layout.setContentsMargins(0, 0, 0, 0)
+        wifi_row_layout.setSpacing(12)
+        wifi_row_layout.addWidget(QLabel("ESP-IP:"))
+        self.input_ampel_ip = QLineEdit(DEFAULT_WIFI_HOST)
+        wifi_row_layout.addWidget(self.input_ampel_ip, stretch=1)
+        ampel_layout.addWidget(self.ampel_wifi_row)
+        self.ampel_wifi_row.setVisible(False)
+
+        # Verbinden-Button + Statuszeile
+        self.btn_ampel_connect = QPushButton("Mit Ampel verbinden")
+        self.btn_ampel_connect.setObjectName("primaryButton")
+        self.btn_ampel_connect.clicked.connect(self.toggle_ampel_connection)
+        ampel_layout.addWidget(self.btn_ampel_connect)
+
+        self.lbl_ampel_status = QLabel("Getrennt")
+        self.lbl_ampel_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
+        ampel_layout.addWidget(self.lbl_ampel_status)
+
+        layout.addWidget(ampel_panel)
+        self.refresh_ampel_ports()
 
         # Athletenauswahl Panel
         athlet_panel = QFrame()
@@ -160,6 +246,68 @@ class MainWindow(QMainWindow):
         if self.client is not None:
             self.client.set_trampoline(trampoline)
 
+    # ---- 6c. Ampel: Transport-Umschalter ----
+    def select_ampel_mode(self, mode):
+        """Schaltet zwischen USB und WLAN um. Nur im getrennten Zustand moeglich."""
+        if self.ampel.is_connected():
+            self.log_message("Ampel: Moduswechsel nur im getrennten Zustand moeglich.")
+            return
+        self.ampel_mode = mode
+        self.btn_ampel_usb.setStyleSheet(
+            TRAMPOLIN_STYLE_ACTIVE if mode == "USB" else TRAMPOLIN_STYLE_INACTIVE)
+        self.btn_ampel_wifi.setStyleSheet(
+            TRAMPOLIN_STYLE_ACTIVE if mode == "WLAN" else TRAMPOLIN_STYLE_INACTIVE)
+        self.ampel_usb_row.setVisible(mode == "USB")
+        self.ampel_wifi_row.setVisible(mode == "WLAN")
+
+    # ---- 6d. Ampel: COM-Ports aktualisieren ----
+    def refresh_ampel_ports(self):
+        self.dropdown_ampel_port.clear()
+        ports = AmpelClient.list_ports()
+        if not ports:
+            self.dropdown_ampel_port.addItem("Kein Port gefunden", None)
+            return
+        for device, description in ports:
+            self.dropdown_ampel_port.addItem(f"{device}  -  {description}", device)
+
+    # ---- 6e. Ampel: Verbinden / Trennen ----
+    def toggle_ampel_connection(self):
+        if self.ampel.is_connected():
+            self.ampel.disconnect()
+            return
+
+        if self.ampel_mode == "WLAN":
+            host = self.input_ampel_ip.text().strip() or DEFAULT_WIFI_HOST
+            self.ampel.connect_wifi(host=host)
+        else:
+            port = self.dropdown_ampel_port.currentData()
+            if port is None:
+                self.log_message("Ampel: Kein COM-Port gefunden - bitte 'Aktualisieren' "
+                                 "druecken oder auf WLAN umschalten.")
+                return
+            self.ampel.connect(port)
+
+    # ---- 6f. Ampel: Callbacks (via SignalBridge im GUI-Thread) ----
+    def on_ampel_connection_changed(self, connected):
+        if connected:
+            transport = "WLAN" if self.ampel_mode == "WLAN" else "USB"
+            self.lbl_ampel_status.setText(f"Verbunden ({transport}) - Ampel AN")
+            self.lbl_ampel_status.setStyleSheet(AMPEL_STATUS_CONNECTED)
+            self.btn_ampel_connect.setText("Ampel trennen")
+        else:
+            self.lbl_ampel_status.setText("Getrennt")
+            self.lbl_ampel_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
+            self.btn_ampel_connect.setText("Mit Ampel verbinden")
+        # Waehrend einer Verbindung ist der Moduswechsel gesperrt.
+        self.btn_ampel_usb.setEnabled(not connected)
+        self.btn_ampel_wifi.setEnabled(not connected)
+
+    def on_ampel_power_changed(self, powered_on):
+        if self.ampel.is_connected():
+            transport = "WLAN" if self.ampel_mode == "WLAN" else "USB"
+            state = "AN" if powered_on else "AUS (Schalter)"
+            self.lbl_ampel_status.setText(f"Verbunden ({transport}) - Ampel {state}")
+
     # ---- 7. Verbindungslogik ----
     def start_connection(self):
         if "trennen" not in self.btn_connect.text().lower():
@@ -229,6 +377,8 @@ class MainWindow(QMainWindow):
             self.analyzer.load_profile(athlet_name, logFcn=self.bridge.log_signal.emit)
 
             self.timer.start()
+            # Ampel: Status-LED auf "Analyse laeuft" (gruen); ohne Verbindung wirkungslos.
+            self.ampel.set_analysis(True)
             self.log_message(f"Analyse gestartet (Trampolin {self.selected_trampoline[-1]}). "
             f"Warte auf Daten von Qira...")
         else:
@@ -238,6 +388,9 @@ class MainWindow(QMainWindow):
             self.btn_analyze.setIconSize(QSize(20, 20))
 
             self.timer.stop()
+            # Ampel: Status-LED zurueck auf "UI verbunden" (gelb), Anzeige leeren.
+            self.ampel.set_analysis(False)
+            self.ampel.display_off()
             self.log_message("Analyse gestoppt.")
 
             if hasattr(self, 'midterm_storage') and len(self.midterm_storage) > 0:
@@ -293,6 +446,16 @@ class MainWindow(QMainWindow):
             self.log_message(f"Session-Viewer geoeffnet fuer: {os.path.basename(path)}")
         except Exception as e:
             self.log_message(f"Fehler beim Oeffnen des Viewers: {e}")
+
+    # ---- 8c. Sauberes Beenden ----
+    def closeEvent(self, event):
+        """Trennt die Ampel-Verbindung sauber, bevor das Fenster schliesst."""
+        try:
+            if self.ampel.is_connected():
+                self.ampel.disconnect()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # ---- 9. Live-Datenabfrage ----
     def check_for_live_data(self):
