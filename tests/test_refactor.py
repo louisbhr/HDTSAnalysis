@@ -17,6 +17,11 @@ Getestet wird:
   c) Eine alte Baseline-CSV ohne "Mode"-Spalte wird rueckwaertskompatibel geladen
      (jump_analyzer.load_profile UND profiler.load_scoring_profile).
   d) Phasen-Weiche: h_rel 0.5 -> "aufbau", h_rel 0.95 -> "halten".
+  e) Ampel-Logik (esp_client.classify_ampel): alle 8 Zweige (4 je Phase) plus
+     Aufbau-Fallback ohne individuelle Aufbau-Baseline.
+  f) Aufbau-Fallback in der Pipeline: baseline_manager speichert bei zu wenigen
+     Aufbau-Spruengen KEINE Aufbau-Zeilen (kein Goldstandard-Fallback fuer
+     "aufbau"); der Analyzer erkennt das und sperrt die Richtungslichter.
 """
 import os
 import sys
@@ -150,12 +155,105 @@ def test_phase_switch():
     print("  OK: h_rel 0.5 -> 'aufbau', h_rel 0.95 -> 'halten'.")
 
 
+def test_ampel_logic():
+    """(e) Alle 8 Zweige der phasenabhaengigen Ampel-Logik + Aufbau-Fallback."""
+    from esp_client import classify_ampel
+
+    # --- Phase "halten" (Score gegen Halten-Referenz) ---
+    # 1) Totband: |trend| < DEADBAND_TREND (0.5) -> GRUEN, Timing stabil.
+    assert classify_ampel(0.2, 1.0, phase="halten") == ("GOOD", 0)
+    # 2) trend > +Totband, Gate ok (1.0/1.2 = 0.83 > 0.6) -> GELB "frueher treten".
+    assert classify_ampel(1.0, 1.2, phase="halten") == ("EARLY", 1)
+    # 3) trend < -Totband, Gate ok (1.5/1.6 = 0.94), abs 1.6 > 1.4 -> Stufe 2, BLAU.
+    assert classify_ampel(-1.5, 1.6, phase="halten") == ("LATE", 2)
+    # 4) Gate verletzt (0.7/2.0 = 0.35 <= 0.6) -> AUS.
+    assert classify_ampel(0.7, 2.0, phase="halten") == ("OFF", 0)
+
+    # --- Phase "aufbau" (Score gegen individuelle Aufbau-Referenz) ---
+    # 5) Erfolg schlaegt Muster: diffI > 0 -> GRUEN, auch bei grosser Abweichung.
+    assert classify_ampel(2.0, 2.5, phase="aufbau", diffI=5.0,
+                          aufbau_reference_ok=True) == ("GOOD", 0)
+    # 6) diffI <= 0 und trend < -Totband -> BLAU "spaeter/laenger treten".
+    assert classify_ampel(-1.0, 1.2, phase="aufbau", diffI=-3.0,
+                          aufbau_reference_ok=True) == ("LATE", 1)
+    # 7) diffI <= 0 und trend > +Totband -> GELB "frueher treten".
+    assert classify_ampel(1.0, 1.2, phase="aufbau", diffI=-3.0,
+                          aufbau_reference_ok=True) == ("EARLY", 1)
+    # 8) diffI <= 0 und |trend| < Totband -> AUS.
+    assert classify_ampel(0.2, 1.0, phase="aufbau", diffI=-3.0,
+                          aufbau_reference_ok=True) == ("OFF", 0)
+
+    # --- Aufbau-Fallback ohne individuelle Aufbau-Baseline ---
+    # Nur diffI-Kriterium: GRUEN bei diffI > 0, sonst AUS - NIE Richtungslichter.
+    assert classify_ampel(2.0, 2.5, phase="aufbau", diffI=5.0,
+                          aufbau_reference_ok=False) == ("GOOD", 0)
+    assert classify_ampel(2.0, 2.5, phase="aufbau", diffI=-3.0,
+                          aufbau_reference_ok=False) == ("OFF", 0)
+    # Erster Sprung (diffI = NaN): keine Aussage moeglich -> AUS.
+    assert classify_ampel(1.0, 1.2, phase="aufbau", diffI=float("nan"),
+                          aufbau_reference_ok=True) == ("OFF", 0)
+
+    print("  OK: 8 Ampel-Zweige (4 je Phase) + Aufbau-Fallback + NaN-diffI korrekt.")
+
+
+def test_aufbau_fallback_pipeline():
+    """(f) Zu wenig Aufbau-Spruenge: keine Aufbau-Zeilen in der Baseline-CSV,
+    Analyzer erkennt den fehlenden Modus als Goldstandard-Quelle."""
+    import pandas as pd
+    import baseline_manager
+
+    tmp_dir = tempfile.mkdtemp(prefix="hdts_test_")
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_dir)
+        shutil.copy(os.path.join(REPO_ROOT, "goldTableNeu.xlsx"), tmp_dir)
+        os.makedirs("athleten_daten", exist_ok=True)
+
+        # Steady-State-Athlet: 30 Spruenge, praktisch kein Hoehengewinn (HG ~ 0)
+        # -> Modus "aufbau" leer, Modus "halten" gut gefuellt.
+        rng = np.random.default_rng(7)
+        rows = []
+        for _ in range(30):
+            rows.append({
+                "Peak_t": 0.11 + rng.normal(0, 0.005),
+                "Peak_Prct": 45.0 + rng.normal(0, 2.0),
+                "Explosiv": 7.0e4 + rng.normal(0, 2000),
+                "preSlope": 7.0e4 + rng.normal(0, 2000),
+                "postSlope": -6.0e4 + rng.normal(0, 2000),
+                "Symmetry": 0.9 + rng.normal(0, 0.05),
+                "Height": 3.0 + rng.normal(0, 0.05),
+                "HG": rng.normal(0.0, 0.02),
+            })
+        pd.DataFrame(rows).to_csv(os.path.join("athleten_daten", "steady_all.csv"), index=False)
+
+        msg = baseline_manager.update_athlete_baseline("steady")
+        assert "kein Referenzsatz" in msg, f"Statusmeldung unerwartet: {msg}"
+
+        df_b = pd.read_csv(os.path.join("athleten_daten", "steady_baseline.csv"))
+        assert set(df_b["Mode"]) == {"halten"}, (
+            f"Baseline-CSV sollte NUR 'halten'-Zeilen enthalten, hat: {set(df_b['Mode'])}")
+
+        analyzer = jump_analyzer_module.JumpAnalyzer()
+        analyzer.load_profile("steady", logFcn=lambda m: None)
+        assert analyzer.mode_sources.get("halten") == "individuelle Baseline"
+        assert analyzer.mode_sources.get("aufbau") == "Goldstandard", (
+            "Fehlender Aufbau-Modus muss als Goldstandard-Quelle erkannt werden "
+            "(-> Ampel sperrt Richtungslichter im Aufbau).")
+
+        print("  OK: Keine Aufbau-Zeilen bei <15 Aufbau-Spruengen, Quelle korrekt erkannt.")
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def main():
     tests = [
         ("a) Profiler: Contact_t/Integral/diffI", test_profiler_columns_and_diffI),
         ("b) compute_jump_score", test_compute_jump_score),
         ("c) Rueckwaertskompatible Baseline", test_backward_compat_baseline_load),
         ("d) Phasen-Weiche", test_phase_switch),
+        ("e) Ampel-Logik (8 Zweige + Fallback)", test_ampel_logic),
+        ("f) Aufbau-Fallback in der Pipeline", test_aufbau_fallback_pipeline),
     ]
 
     failures = 0
