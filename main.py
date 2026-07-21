@@ -10,7 +10,7 @@ from PyQt6.QtCore import QTimer, QObject, pyqtSignal, QSize, Qt
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QTextEdit, QVBoxLayout, QWidget,
     QFrame, QComboBox, QInputDialog, QMessageBox, QHBoxLayout, QLabel, QFileDialog,
-    QLineEdit,
+    QLineEdit, QSizePolicy,
 )
 from PyQt6.QtGui import QIcon
 
@@ -21,11 +21,6 @@ from esp_client import AmpelClient, DEFAULT_WIFI_HOST
 from profiler import run_offline_profiler, ALL_COLUMNS, BASELINE_COLUMNS
 from baseline_manager import update_athlete_baseline
 import session_storage
-import qira_launcher
-
-# Qira-Autostart: Wartezeit (Sekunden), bis Qira im Vordergrund ist und die
-# Leertaste (Mess-Modus) sinnvoll ankommt. Am echten Laptop ggf. anpassen.
-QIRA_START_KEY_DELAY_S = 6.0
 
 # Stil fuer die Trampolin-Buttons (dunkelgrau = inaktiv, hellgrau = aktiv).
 TRAMPOLIN_STYLE_INACTIVE = (
@@ -76,9 +71,6 @@ class SignalBridge(QObject):
     # Per-Sprung-Infos aus dem Analyzer (laufen im Timer/GUI-Thread, werden aber
     # ueber das Signal einheitlich thread-sicher an das Dashboard geliefert).
     jump_signal = pyqtSignal(dict)
-    # Protokollzeile aus Hintergrund-Threads (z.B. Qira-Autostart), Reihenfolge
-    # (level, text) - thread-sicher in den GUI-Thread gehoben.
-    log_level_signal = pyqtSignal(str, str)
 
 
 class MainWindow(QMainWindow):
@@ -103,7 +95,6 @@ class MainWindow(QMainWindow):
         self.bridge.log_signal.connect(self.log_message)
         self.bridge.qira_connection_signal.connect(self.on_qira_connection_changed)
         self.bridge.jump_signal.connect(self.on_jump_update)
-        self.bridge.log_level_signal.connect(self._on_bg_log)
 
         # ---- 2. Qira-Client und JumpAnalyzer ----
         self._qira_connected = False
@@ -262,9 +253,14 @@ class MainWindow(QMainWindow):
         ampel_layout.addWidget(self.ampel_wifi_row)
         self.ampel_wifi_row.setVisible(False)
 
+        # Flexibler Abstand: schiebt Verbinden-Button + Status an den unteren Rand
+        # der Karte, damit das (nach unten wachsende) Panel gleichmaessig gefuellt ist.
+        ampel_layout.addStretch(1)
+
         # Verbinden-Button + Statuszeile
         self.btn_ampel_connect = QPushButton("Mit Ampel verbinden")
         self.btn_ampel_connect.setObjectName("primaryButton")
+        self.btn_ampel_connect.setMinimumHeight(46)
         self.btn_ampel_connect.clicked.connect(self.toggle_ampel_connection)
         ampel_layout.addWidget(self.btn_ampel_connect)
 
@@ -275,11 +271,12 @@ class MainWindow(QMainWindow):
         self.refresh_ampel_ports()
         self._update_ampel_editor_visibility()
 
-        # --- RECHTS 2+3: Aktionsbuttons ---
+        # --- RECHTS 2+3: Aktionsbuttons (groesser, fuellen die rechte Spalte) ---
         self.btn_analyze = QPushButton("Analyse starten")
         self.btn_analyze.setObjectName("primaryButton")
         self.btn_analyze.setIcon(qta.icon("msc.play", color="white"))
-        self.btn_analyze.setIconSize(QSize(20, 20))
+        self.btn_analyze.setIconSize(QSize(22, 22))
+        self.btn_analyze.setMinimumHeight(64)
         self.btn_analyze.clicked.connect(self.start_analysis)
         # Erst klickbar, wenn Qira + Ampel verbunden UND ein Trampolin gewaehlt ist.
         self.btn_analyze.setEnabled(False)
@@ -287,7 +284,8 @@ class MainWindow(QMainWindow):
         self.btn_viewer = QPushButton("Gespeicherte Session ansehen")
         self.btn_viewer.setObjectName("primaryButton")
         self.btn_viewer.setIcon(qta.icon("msc.graph-line", color="white"))
-        self.btn_viewer.setIconSize(QSize(20, 20))
+        self.btn_viewer.setIconSize(QSize(22, 22))
+        self.btn_viewer.setMinimumHeight(64)
         self.btn_viewer.clicked.connect(self.open_session_viewer)
 
         # --- Spalten zusammensetzen ---
@@ -299,13 +297,14 @@ class MainWindow(QMainWindow):
         left_col.addWidget(tramp_card)
         left_col.addStretch(1)
 
+        # Ampel-Panel darf vertikal mitwachsen, damit die rechte Spalte gefuellt ist
+        # und unten buendig mit der linken abschliesst (statt einer leeren Luecke).
+        ampel_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
         right_col = QVBoxLayout()
         right_col.setContentsMargins(0, 0, 0, 0)
         right_col.setSpacing(16)
-        right_col.addWidget(ampel_card)
-        # Stretch schiebt die Aktionsbuttons an den unteren Rand, damit die rechte
-        # Spalte auf gleicher Hoehe endet wie die (hoehere) linke Spalte.
-        right_col.addStretch(1)
+        right_col.addWidget(ampel_card, stretch=1)
         right_col.addWidget(self.btn_analyze)
         right_col.addWidget(self.btn_viewer)
 
@@ -381,40 +380,6 @@ class MainWindow(QMainWindow):
 
         self.log_message("System bereit. Athlet und Trampolin wählen.", level="info")
 
-        # ---- 6. Qira automatisch mitstarten (UWP-App) + Mess-Modus (Leertaste) ----
-        # Laeuft im Hintergrund; danach versucht die App, sich selbststaendig mit
-        # Qira zu verbinden (mit Wiederholungen, da Qira ein paar Sekunden braucht).
-        self._qira_autoconnect_attempts = 0
-        self._qira_autoconnect_max = 12
-        self.qira_connect_timer = QTimer()
-        self.qira_connect_timer.setInterval(3000)
-        self.qira_connect_timer.timeout.connect(self._qira_autoconnect_tick)
-        self._start_qira_autostart()
-
-    # ---- 5b. Qira-Autostart + automatischer Verbindungsaufbau ----
-    def _start_qira_autostart(self):
-        """Startet Qira (Best effort) und beginnt danach den Auto-Verbindungsversuch."""
-        qira_launcher.autostart_qira(
-            log=self.bridge.log_level_signal.emit,
-            key_delay_s=QIRA_START_KEY_DELAY_S,
-        )
-        # Erst nach kurzer Wartezeit mit dem Verbinden beginnen (Qira bootet noch).
-        QTimer.singleShot(2000, self.qira_connect_timer.start)
-
-    def _qira_autoconnect_tick(self):
-        """Versucht periodisch, sich mit Qira zu verbinden, bis es klappt."""
-        if self._qira_connected:
-            self.qira_connect_timer.stop()
-            return
-        if self._qira_autoconnect_attempts >= self._qira_autoconnect_max:
-            self.qira_connect_timer.stop()
-            self.log_message("Qira nicht automatisch erreichbar – bitte manuell verbinden.",
-                             level="warning")
-            return
-        self._qira_autoconnect_attempts += 1
-        # start_connection() baut (nur wenn getrennt) einen neuen Verbindungsversuch auf.
-        self.start_connection()
-
     # ---- 6. Log ----
     def log_message(self, text, level=None):
         """Schreibt eine Protokollzeile, farblich nach Wichtigkeit.
@@ -430,10 +395,6 @@ class MainWindow(QMainWindow):
         safe = html.escape(str(text))
         self.log_viewer.append(
             f'<span style="color:{color};">{timestamp} &nbsp;·&nbsp; {safe}</span>')
-
-    def _on_bg_log(self, level, text):
-        """Adapter: Hintergrund-Threads liefern (level, text); log_message will (text, level)."""
-        self.log_message(text, level)
 
     @staticmethod
     def _detect_log_level(text):
@@ -633,9 +594,6 @@ class MainWindow(QMainWindow):
             self.btn_connect.setIcon(disconnect_icon)
             self.lbl_qira_status.setText("Verbunden")
             self.lbl_qira_status.setStyleSheet(AMPEL_STATUS_CONNECTED)
-            # Verbindung steht -> automatische Wiederholversuche beenden.
-            if hasattr(self, "qira_connect_timer"):
-                self.qira_connect_timer.stop()
         else:
             self.btn_connect.setStyleSheet("")
             self.btn_connect.setText("Mit Qira verbinden")
