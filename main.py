@@ -110,6 +110,8 @@ class MainWindow(QMainWindow):
         self.analyzer.set_on_jump(self.bridge.jump_signal.emit)
         # Transportweg der Ampel ("USB" / "WLAN")
         self.ampel_mode = "USB"
+        # Bearbeitungs-Modus fuer Port/IP (Default aus: nur Umschalten + Verbinden).
+        self.ampel_edit_mode = False
 
         self.gui_last_block_id = -1
         self.midterm_storage = []
@@ -155,7 +157,9 @@ class MainWindow(QMainWindow):
         # --- Karte rechts: Ampel (ESP32) ---
         ampel_card, ampel_layout = make_card("Ampel (ESP32)")
 
-        # Transport-Umschalter USB / WLAN (nur im getrennten Zustand umschaltbar).
+        # Transport-Umschalter USB / WLAN + kleiner Bearbeiten-Button.
+        # Normalfall: Port wird automatisch gewaehlt, IP ist voreingestellt - die
+        # editierbaren Zeilen erscheinen erst im Bearbeitungs-Modus.
         ampel_mode_row = QHBoxLayout()
         ampel_mode_row.setSpacing(12)
         self.btn_ampel_usb = QPushButton("USB")
@@ -164,30 +168,48 @@ class MainWindow(QMainWindow):
         self.btn_ampel_wifi.setStyleSheet(TRAMPOLIN_STYLE_INACTIVE)
         self.btn_ampel_usb.clicked.connect(lambda: self.select_ampel_mode("USB"))
         self.btn_ampel_wifi.clicked.connect(lambda: self.select_ampel_mode("WLAN"))
-        ampel_mode_row.addWidget(self.btn_ampel_usb)
-        ampel_mode_row.addWidget(self.btn_ampel_wifi)
+        self.btn_ampel_edit = QPushButton()
+        self.btn_ampel_edit.setObjectName("iconButton")
+        self.btn_ampel_edit.setIcon(qta.icon("msc.edit", color="#C8C8CC"))
+        self.btn_ampel_edit.setIconSize(QSize(18, 18))
+        self.btn_ampel_edit.setFixedWidth(44)
+        self.btn_ampel_edit.setToolTip("Port/IP bearbeiten")
+        self.btn_ampel_edit.clicked.connect(self.toggle_ampel_edit)
+        ampel_mode_row.addWidget(self.btn_ampel_usb, stretch=1)
+        ampel_mode_row.addWidget(self.btn_ampel_wifi, stretch=1)
+        ampel_mode_row.addWidget(self.btn_ampel_edit)
         ampel_layout.addLayout(ampel_mode_row)
 
-        # USB-Zeile: COM-Port-Auswahl + Aktualisieren
+        # Kompakte Infozeile (Normalmodus): zeigt, womit verbunden wird.
+        self.lbl_ampel_target = QLabel("")
+        self.lbl_ampel_target.setObjectName("mutedInfo")
+        ampel_layout.addWidget(self.lbl_ampel_target)
+
+        # USB-Zeile: COM-Port-Auswahl + Aktualisieren (nur im Bearbeitungs-Modus).
         self.ampel_usb_row = QWidget()
         usb_row_layout = QHBoxLayout(self.ampel_usb_row)
         usb_row_layout.setContentsMargins(0, 0, 0, 0)
         usb_row_layout.setSpacing(12)
         self.dropdown_ampel_port = QComboBox()
         self.dropdown_ampel_port.setObjectName("athletDropdown")
+        self.dropdown_ampel_port.currentIndexChanged.connect(
+            lambda _idx: self._update_ampel_target_label())
         self.btn_ampel_refresh = QPushButton("Aktualisieren")
         self.btn_ampel_refresh.clicked.connect(self.refresh_ampel_ports)
         usb_row_layout.addWidget(self.dropdown_ampel_port, stretch=7)
         usb_row_layout.addWidget(self.btn_ampel_refresh, stretch=3)
         ampel_layout.addWidget(self.ampel_usb_row)
+        self.ampel_usb_row.setVisible(False)
 
-        # WLAN-Zeile: IP-Feld (Standard: Access-Point-IP der Firmware)
+        # WLAN-Zeile: IP-Feld (Standard: Access-Point-IP der Firmware; nur im Edit-Modus).
         self.ampel_wifi_row = QWidget()
         wifi_row_layout = QHBoxLayout(self.ampel_wifi_row)
         wifi_row_layout.setContentsMargins(0, 0, 0, 0)
         wifi_row_layout.setSpacing(12)
         wifi_row_layout.addWidget(QLabel("ESP-IP:"))
         self.input_ampel_ip = QLineEdit(DEFAULT_WIFI_HOST)
+        self.input_ampel_ip.textChanged.connect(
+            lambda _t: self._update_ampel_target_label())
         wifi_row_layout.addWidget(self.input_ampel_ip, stretch=1)
         ampel_layout.addWidget(self.ampel_wifi_row)
         self.ampel_wifi_row.setVisible(False)
@@ -208,7 +230,9 @@ class MainWindow(QMainWindow):
         conn_row.addWidget(qira_card, stretch=1)
         conn_row.addWidget(ampel_card, stretch=1)
         root.addLayout(conn_row)
+        # Ports einlesen + automatisch ersten waehlen, Infozeile/Sichtbarkeit setzen.
         self.refresh_ampel_ports()
+        self._update_ampel_editor_visibility()
 
         # ---------------------------------------------------------------
         # Zeile 2: Setup (Athlet + Trampolin) nebeneinander
@@ -255,6 +279,8 @@ class MainWindow(QMainWindow):
         self.btn_analyze.setIcon(qta.icon("msc.play", color="white"))
         self.btn_analyze.setIconSize(QSize(20, 20))
         self.btn_analyze.clicked.connect(self.start_analysis)
+        # Erst klickbar, wenn Qira + Ampel verbunden UND ein Trampolin gewaehlt ist.
+        self.btn_analyze.setEnabled(False)
 
         self.btn_viewer = QPushButton("Gespeicherte Session ansehen")
         self.btn_viewer.setObjectName("primaryButton")
@@ -345,6 +371,20 @@ class MainWindow(QMainWindow):
             TRAMPOLIN_STYLE_ACTIVE if trampoline == "T2" else TRAMPOLIN_STYLE_INACTIVE)
         if self.client is not None:
             self.client.set_trampoline(trampoline)
+        self._update_analyze_enabled()
+
+    # ---- 6b2. "Analyse starten" nur bei erfuellten Vorbedingungen freigeben ----
+    def _update_analyze_enabled(self):
+        """Aktiviert den Analyse-Button nur, wenn Qira UND Ampel verbunden sind
+        und ein Trampolin gewaehlt ist. Waehrend einer laufenden Analyse bleibt
+        der Button aktiv (damit man immer stoppen kann)."""
+        if self.btn_analyze.text() == "Analyse stoppen":
+            self.btn_analyze.setEnabled(True)
+            return
+        ready = (self._qira_connected
+                 and self.ampel.is_connected()
+                 and self.selected_trampoline in ("T1", "T2"))
+        self.btn_analyze.setEnabled(ready)
 
     # ---- 6c. Ampel: Transport-Umschalter ----
     def select_ampel_mode(self, mode):
@@ -357,18 +397,58 @@ class MainWindow(QMainWindow):
             TRAMPOLIN_STYLE_ACTIVE if mode == "USB" else TRAMPOLIN_STYLE_INACTIVE)
         self.btn_ampel_wifi.setStyleSheet(
             TRAMPOLIN_STYLE_ACTIVE if mode == "WLAN" else TRAMPOLIN_STYLE_INACTIVE)
-        self.ampel_usb_row.setVisible(mode == "USB")
-        self.ampel_wifi_row.setVisible(mode == "WLAN")
+        # Bei USB die Ports frisch einlesen und automatisch den ersten waehlen.
+        if mode == "USB":
+            self.refresh_ampel_ports()
+        self._update_ampel_editor_visibility()
+        self._update_ampel_target_label()
 
-    # ---- 6d. Ampel: COM-Ports aktualisieren ----
+    # ---- 6c2. Ampel: Bearbeitungs-Modus fuer Port/IP umschalten ----
+    def toggle_ampel_edit(self):
+        """Blendet die editierbare Port-/IP-Zeile ein bzw. aus. Bei bestehender
+        Verbindung gesperrt (dann sind Port/IP ohnehin fixiert)."""
+        if self.ampel.is_connected():
+            self.log_message("Ampel: Bearbeiten nur im getrennten Zustand moeglich.")
+            return
+        self.ampel_edit_mode = not self.ampel_edit_mode
+        self._update_ampel_editor_visibility()
+
+    # ---- 6c3. Ampel: Sichtbarkeit Editor-Zeilen vs. Infozeile ----
+    def _update_ampel_editor_visibility(self):
+        editing = self.ampel_edit_mode and not self.ampel.is_connected()
+        self.ampel_usb_row.setVisible(editing and self.ampel_mode == "USB")
+        self.ampel_wifi_row.setVisible(editing and self.ampel_mode == "WLAN")
+        # Infozeile nur im Normalmodus (sonst zeigt die Editor-Zeile die Auswahl).
+        self.lbl_ampel_target.setVisible(not editing)
+        # Bearbeiten-Button optisch aktiv, solange der Modus laeuft.
+        self.btn_ampel_edit.setStyleSheet(
+            TRAMPOLIN_STYLE_ACTIVE if editing else "")
+
+    # ---- 6c4. Ampel: Infozeile "womit verbunden wird" aktualisieren ----
+    def _update_ampel_target_label(self):
+        if self.ampel_mode == "WLAN":
+            ip = self.input_ampel_ip.text().strip() or DEFAULT_WIFI_HOST
+            self.lbl_ampel_target.setText(f"WLAN  ·  IP: {ip}")
+        else:
+            port = self.dropdown_ampel_port.currentData()
+            if port:
+                self.lbl_ampel_target.setText(f"USB  ·  Port: {port} (automatisch)")
+            else:
+                self.lbl_ampel_target.setText("USB  ·  kein Port gefunden - 'Bearbeiten' → 'Aktualisieren'")
+
+    # ---- 6d. Ampel: COM-Ports aktualisieren (+ ersten automatisch waehlen) ----
     def refresh_ampel_ports(self):
+        self.dropdown_ampel_port.blockSignals(True)
         self.dropdown_ampel_port.clear()
         ports = AmpelClient.list_ports()
         if not ports:
             self.dropdown_ampel_port.addItem("Kein Port gefunden", None)
-            return
-        for device, description in ports:
-            self.dropdown_ampel_port.addItem(f"{device}  -  {description}", device)
+        else:
+            for device, description in ports:
+                self.dropdown_ampel_port.addItem(f"{device}  -  {description}", device)
+            self.dropdown_ampel_port.setCurrentIndex(0)   # automatisch ersten Port
+        self.dropdown_ampel_port.blockSignals(False)
+        self._update_ampel_target_label()
 
     # ---- 6e. Ampel: Verbinden / Trennen ----
     def toggle_ampel_connection(self):
@@ -382,8 +462,8 @@ class MainWindow(QMainWindow):
         else:
             port = self.dropdown_ampel_port.currentData()
             if port is None:
-                self.log_message("Ampel: Kein COM-Port gefunden - bitte 'Aktualisieren' "
-                                 "druecken oder auf WLAN umschalten.")
+                self.log_message("Ampel: Kein COM-Port gefunden - im Bearbeiten-Modus "
+                                 "'Aktualisieren' druecken oder auf WLAN umschalten.")
                 return
             self.ampel.connect(port)
 
@@ -394,13 +474,24 @@ class MainWindow(QMainWindow):
             self.lbl_ampel_status.setText(f"Verbunden ({transport}) - Ampel AN")
             self.lbl_ampel_status.setStyleSheet(AMPEL_STATUS_CONNECTED)
             self.btn_ampel_connect.setText("Ampel trennen")
+            # Wie beim Qira-Button: verbunden -> rot ("trennen").
+            self.btn_ampel_connect.setStyleSheet(
+                "background-color: #FF3B30; color: white; font-weight: bold; "
+                "border-radius: 6px; padding: 10px;")
         else:
             self.lbl_ampel_status.setText("Getrennt")
             self.lbl_ampel_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
             self.btn_ampel_connect.setText("Mit Ampel verbinden")
-        # Waehrend einer Verbindung ist der Moduswechsel gesperrt.
+            self.btn_ampel_connect.setStyleSheet("")   # zurueck auf primaryButton-Blau
+        # Waehrend einer Verbindung sind Moduswechsel und Bearbeiten gesperrt.
         self.btn_ampel_usb.setEnabled(not connected)
         self.btn_ampel_wifi.setEnabled(not connected)
+        self.btn_ampel_edit.setEnabled(not connected)
+        if connected and self.ampel_edit_mode:
+            self.ampel_edit_mode = False
+        self._update_ampel_editor_visibility()
+        # Ampel-Verbindung ist eine der Vorbedingungen fuer die Analyse.
+        self._update_analyze_enabled()
 
     def on_ampel_power_changed(self, powered_on):
         if self.ampel.is_connected():
@@ -459,6 +550,8 @@ class MainWindow(QMainWindow):
             self.btn_connect.setIconSize(QSize(20, 20))
             self.lbl_qira_status.setText("Getrennt")
             self.lbl_qira_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
+        # Qira-Verbindung ist eine der Vorbedingungen fuer die Analyse.
+        self._update_analyze_enabled()
 
     # ---- 7c. Dashboard: Kacheln aktualisieren / zuruecksetzen ----
     def _apply_ampel_tile(self, direction):
@@ -542,6 +635,8 @@ class MainWindow(QMainWindow):
             self.ampel.set_analysis(False)
             self.ampel.display_off()
             self.log_message("Analyse gestoppt.")
+            # Nach dem Stoppen wieder anhand der Vorbedingungen freigeben/sperren.
+            self._update_analyze_enabled()
 
             if hasattr(self, 'midterm_storage') and len(self.midterm_storage) > 0:
                 # Gemeinsamer Zeitstempel fuer CSV und Session-Datei.
@@ -692,6 +787,14 @@ if __name__ == "__main__":
             border-radius: 6px; padding: 10px 20px; font-size: 11pt; letter-spacing: 0.5px;
         }
         QPushButton#primaryButton:hover { background-color: #33BEFF; }
+        QPushButton#primaryButton:disabled {
+            background-color: #23252B; color: #5A5A62;
+        }
+        QPushButton#iconButton {
+            background-color: #3A3A3F; border: none; border-radius: 6px; padding: 8px;
+        }
+        QPushButton#iconButton:hover { background-color: #4A4A50; }
+        QLabel#mutedInfo { color: #8A8A90; font-size: 9pt; }
         QTextEdit {
             background-color: #1A1A1E; border: 1px solid #29292E; border-radius: 8px;
             padding: 10px; color: #00E676;
