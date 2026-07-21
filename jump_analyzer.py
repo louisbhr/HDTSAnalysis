@@ -84,6 +84,11 @@ class JumpAnalyzer:
         self.ampel_client = None
         self.last_ampel_state = ("OFF", 0)
 
+        # Optionaler Per-Sprung-Callback fuer ein Live-Dashboard (GUI). Wird per
+        # set_on_jump() gesetzt und nach jedem erkannten Sprung mit einem kompakten
+        # dict aufgerufen. Ohne Callback laeuft die Analyse unveraendert weiter.
+        self.on_jump = None
+
         # Integral des zuletzt verarbeiteten Kontakts, fuer diffI = Integral(i) - Integral(i-1).
         self.last_integral = None
 
@@ -203,6 +208,17 @@ class JumpAnalyzer:
         self.last_ampel_state abgelegt (fuer GUI/Debug).
         """
         self.ampel_client = client
+
+    # ---- 2c. Live-Dashboard (GUI) anbinden ----
+    def set_on_jump(self, callback):
+        """Setzt (oder entfernt, mit None) einen Per-Sprung-Callback fuer die GUI.
+
+        Der Callback wird nach jedem erkannten Sprung mit einem dict aufgerufen:
+            {"jump_no", "phase", "ampel_direction", "ampel_level"}
+        Er laeuft im selben Thread wie process(); die GUI hebt ihn per Qt-Signal
+        thread-sicher in den GUI-Thread (analog zu den Verbindungs-Callbacks).
+        """
+        self.on_jump = callback
 
     # ---- 3. Kontaktgrenzen fuer einen Peak ----
     def _calculate_contact_bounds_for_peak(self, i, signal_array):
@@ -465,6 +481,20 @@ class JumpAnalyzer:
                         self.ampel_client.send_state(led_direction, led_level)
                     except Exception as e:
                         logFcn(f"Ampel: Sendefehler aus dem Analyzer ({e}).")
+
+            # ~ 4.6 Live-Dashboard (GUI): Schnellinfos zum aktuellen Sprung ~
+            # Laeuft immer (auch ohne Ampel-Client / ohne classify_ampel); Fehler
+            # im Callback duerfen die Analyse nie stoeren.
+            if self.on_jump is not None:
+                try:
+                    self.on_jump({
+                        "jump_no": self.total_jump_count,
+                        "phase": phase,
+                        "ampel_direction": self.last_ampel_state[0],
+                        "ampel_level": self.last_ampel_state[1],
+                    })
+                except Exception:
+                    pass
 
             self.last_analyzed_jump_idx = next_jump_idx
 

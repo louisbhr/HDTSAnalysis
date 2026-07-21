@@ -32,9 +32,21 @@ TRAMPOLIN_STYLE_ACTIVE = (
 )
 
 
-# Stil fuer den Ampel-Status ("Getrennt" rot, "Verbunden" gruen).
+# Stil fuer den Verbindungs-Status ("Getrennt" rot, "Verbunden" gruen).
+# Wird sowohl fuer die Ampel- als auch die Qira-Statuszeile genutzt.
 AMPEL_STATUS_DISCONNECTED = "color: #FF3B30; font-weight: bold;"
 AMPEL_STATUS_CONNECTED = "color: #00E676; font-weight: bold;"
+
+# Dashboard: Zuordnung Ampel-Richtung -> (Anzeigetext, Kachel-Hintergrund, Textfarbe).
+# Spiegelt die ESP32-Ampel: GELB=frueher, BLAU=spaeter, GRUEN=gut, AUS=keine Ansage.
+AMPEL_TILE_MAP = {
+    "GOOD":  ("GUT",           "#00E676", "#0A0A0A"),
+    "EARLY": ("FRÜHER TRETEN", "#FFAA00", "#0A0A0A"),
+    "LATE":  ("SPÄTER TRETEN", "#6A00E0", "#FFFFFF"),
+    "OFF":   ("—",             "#2A2A2E", "#8A8A90"),
+}
+# Neutraler Leerzustand der Kacheln (vor dem ersten Sprung / nach Analyse-Stopp).
+DASHBOARD_EMPTY = ("—", "#2A2A2E", "#8A8A90")
 
 
 # Ein Signal-Verteiler, um Thread-Sicherheit fuer die GUI zu garantieren
@@ -47,6 +59,9 @@ class SignalBridge(QObject):
     # ueber Signale in den GUI-Thread gehoben werden.
     ampel_conn_signal = pyqtSignal(bool)
     ampel_power_signal = pyqtSignal(bool)
+    # Per-Sprung-Infos aus dem Analyzer (laufen im Timer/GUI-Thread, werden aber
+    # ueber das Signal einheitlich thread-sicher an das Dashboard geliefert).
+    jump_signal = pyqtSignal(dict)
 
 
 class MainWindow(QMainWindow):
@@ -54,13 +69,23 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("HDTS Analyse - Live")
-        self.resize(600, 640)
+        # Fenster nutzt die volle nutzbare Bildschirmhoehe; Breite so, dass die
+        # zwei Verbindungs-Karten bequem nebeneinander passen. Bleibt skalierbar.
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        win_w = 980
+        win_h = avail.height() if avail is not None else 900
+        self.resize(win_w, win_h)
+        self.setMinimumWidth(880)
+        if avail is not None:
+            self.move(avail.x() + max(0, (avail.width() - win_w) // 2), avail.y())
         self.setWindowIcon(QIcon("app_icon.ico"))
 
         # ---- 1. Signal-Bridge ----
         self.bridge = SignalBridge()
         self.bridge.log_signal.connect(self.log_message)
         self.bridge.qira_connection_signal.connect(self.on_qira_connection_changed)
+        self.bridge.jump_signal.connect(self.on_jump_update)
 
         # ---- 2. Qira-Client und JumpAnalyzer ----
         self._qira_connected = False
@@ -80,6 +105,9 @@ class MainWindow(QMainWindow):
         # Analyzer sendet nach jedem Sprung den Ampel-Zustand; ohne Verbindung
         # sind die Sendeaufrufe im AmpelClient wirkungslos (kein Fehler).
         self.analyzer.set_ampel_client(self.ampel)
+        # Analyzer liefert nach jedem Sprung Schnellinfos ans Dashboard (thread-
+        # sicher ueber die SignalBridge in den GUI-Thread gehoben).
+        self.analyzer.set_on_jump(self.bridge.jump_signal.emit)
         # Transportweg der Ampel ("USB" / "WLAN")
         self.ampel_mode = "USB"
 
@@ -90,25 +118,42 @@ class MainWindow(QMainWindow):
         self.selected_trampoline = None
 
         # ---- 3. GUI Layout ----
-        layout = QVBoxLayout()
+        # Einheitliche Karten-Optik: jeder Abschnitt sitzt in einer "card"-QFrame
+        # mit gleichem Rahmen/Radius/Innenabstand und optionalem Titel.
+        root = QVBoxLayout()
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(16)
 
+        def make_card(title=None):
+            card = QFrame()
+            card.setObjectName("card")
+            inner = QVBoxLayout(card)
+            inner.setContentsMargins(20, 16, 20, 18)
+            inner.setSpacing(12)
+            if title:
+                lbl = QLabel(title)
+                lbl.setObjectName("sectionTitle")
+                inner.addWidget(lbl)
+            return card, inner
+
+        # ---------------------------------------------------------------
+        # Zeile 1: Verbindungen nebeneinander (bestimmt die Fensterbreite)
+        # ---------------------------------------------------------------
+        # --- Karte links: Verbindung Qira ---
+        qira_card, qira_layout = make_card("Verbindung Qira")
         self.btn_connect = QPushButton("Mit Qira verbinden")
         self.btn_connect.setObjectName("primaryButton")
         self.btn_connect.setIcon(qta.icon("msc.link", color="white"))
         self.btn_connect.setIconSize(QSize(20, 20))
         self.btn_connect.clicked.connect(self.start_connection)
-        layout.addWidget(self.btn_connect)
+        qira_layout.addWidget(self.btn_connect)
+        self.lbl_qira_status = QLabel("Getrennt")
+        self.lbl_qira_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
+        qira_layout.addWidget(self.lbl_qira_status)
+        qira_layout.addStretch(1)
 
-        # ---- Ampel (ESP32) Panel ----
-        ampel_panel = QFrame()
-        ampel_panel.setObjectName("athletPanel")
-        ampel_layout = QVBoxLayout(ampel_panel)
-        ampel_layout.setContentsMargins(20, 16, 20, 20)
-        ampel_layout.setSpacing(12)
-
-        lbl_ampel = QLabel("Ampel (ESP32)")
-        lbl_ampel.setObjectName("sectionTitle")
-        ampel_layout.addWidget(lbl_ampel)
+        # --- Karte rechts: Ampel (ESP32) ---
+        ampel_card, ampel_layout = make_card("Ampel (ESP32)")
 
         # Transport-Umschalter USB / WLAN (nur im getrennten Zustand umschaltbar).
         ampel_mode_row = QHBoxLayout()
@@ -156,38 +201,33 @@ class MainWindow(QMainWindow):
         self.lbl_ampel_status = QLabel("Getrennt")
         self.lbl_ampel_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
         ampel_layout.addWidget(self.lbl_ampel_status)
+        ampel_layout.addStretch(1)
 
-        layout.addWidget(ampel_panel)
+        conn_row = QHBoxLayout()
+        conn_row.setSpacing(16)
+        conn_row.addWidget(qira_card, stretch=1)
+        conn_row.addWidget(ampel_card, stretch=1)
+        root.addLayout(conn_row)
         self.refresh_ampel_ports()
 
-        # Athletenauswahl Panel
-        athlet_panel = QFrame()
-        athlet_panel.setObjectName("athletPanel")
-        athlet_layout = QVBoxLayout(athlet_panel)
-        athlet_layout.setContentsMargins(20, 16, 20, 20)
-        athlet_layout.setSpacing(12)
-
-        lbl_athlet = QLabel("Athlet auswählen")
-        lbl_athlet.setObjectName("sectionTitle")
-        athlet_layout.addWidget(lbl_athlet)
-
+        # ---------------------------------------------------------------
+        # Zeile 2: Setup (Athlet + Trampolin) nebeneinander
+        # ---------------------------------------------------------------
+        athlet_card, athlet_layout = make_card("Athlet auswählen")
         dropdown_row = QHBoxLayout()
         dropdown_row.setSpacing(12)
-
         athlet_icon = QLabel()
         athlet_icon.setPixmap(qta.icon("msc.person", color="#00B0FF").pixmap(QSize(28, 28)))
         athlet_icon.setObjectName("athletIcon")
         athlet_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
         self.dropdown_athleten = QComboBox()
         self.dropdown_athleten.setObjectName("athletDropdown")
-
         dropdown_row.addWidget(athlet_icon, stretch=1)
         dropdown_row.addWidget(self.dropdown_athleten, stretch=9)
         athlet_layout.addLayout(dropdown_row)
-        layout.addWidget(athlet_panel)
+        athlet_layout.addStretch(1)
 
-        # ---- NEU: Trampolin-Auswahl (zwischen Athletenauswahl und "Analyse starten") ----
+        tramp_card, tramp_layout = make_card("Trampolin")
         tramp_row = QHBoxLayout()
         tramp_row.setSpacing(12)
         self.btn_tramp1 = QPushButton("Trampolin 1")
@@ -198,31 +238,84 @@ class MainWindow(QMainWindow):
         self.btn_tramp2.clicked.connect(lambda: self.select_trampoline("T2"))
         tramp_row.addWidget(self.btn_tramp1)
         tramp_row.addWidget(self.btn_tramp2)
-        layout.addLayout(tramp_row)
+        tramp_layout.addLayout(tramp_row)
+        tramp_layout.addStretch(1)
 
-        # Analyse starten Button
+        setup_row = QHBoxLayout()
+        setup_row.setSpacing(16)
+        setup_row.addWidget(athlet_card, stretch=1)
+        setup_row.addWidget(tramp_card, stretch=1)
+        root.addLayout(setup_row)
+
+        # ---------------------------------------------------------------
+        # Zeile 3: Aktionen (Analyse starten / Session ansehen)
+        # ---------------------------------------------------------------
         self.btn_analyze = QPushButton("Analyse starten")
         self.btn_analyze.setObjectName("primaryButton")
         self.btn_analyze.setIcon(qta.icon("msc.play", color="white"))
         self.btn_analyze.setIconSize(QSize(20, 20))
         self.btn_analyze.clicked.connect(self.start_analysis)
-        layout.addWidget(self.btn_analyze)
 
-        # ---- NEU: Button, um gespeicherte Sessions anzusehen ----
         self.btn_viewer = QPushButton("Gespeicherte Session ansehen")
         self.btn_viewer.setObjectName("primaryButton")
         self.btn_viewer.setIcon(qta.icon("msc.graph-line", color="white"))
         self.btn_viewer.setIconSize(QSize(20, 20))
         self.btn_viewer.clicked.connect(self.open_session_viewer)
-        layout.addWidget(self.btn_viewer)
 
-        # Log-Viewer
+        action_row = QHBoxLayout()
+        action_row.setSpacing(16)
+        action_row.addWidget(self.btn_analyze, stretch=1)
+        action_row.addWidget(self.btn_viewer, stretch=1)
+        root.addLayout(action_row)
+
+        # ---------------------------------------------------------------
+        # Zeile 4: Dashboard - Schnellinfos zum aktuellen Sprung (KPI-Kacheln)
+        # ---------------------------------------------------------------
+        dash_card, dash_layout = make_card("Aktueller Sprung")
+
+        def make_tile(caption, object_name="kpiTile"):
+            tile = QFrame()
+            tile.setObjectName(object_name)
+            tv = QVBoxLayout(tile)
+            tv.setContentsMargins(16, 14, 16, 14)
+            tv.setSpacing(6)
+            cap = QLabel(caption)
+            cap.setObjectName("kpiCaption")
+            cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            val = QLabel("—")
+            val.setObjectName("kpiValue")
+            val.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            val.setWordWrap(True)
+            tv.addWidget(cap)
+            tv.addWidget(val)
+            return tile, val
+
+        self.tile_jump, self.lbl_jump_value = make_tile("Sprung")
+        self.tile_phase, self.lbl_phase_value = make_tile("Phase")
+        self.tile_ampel, self.lbl_ampel_value = make_tile("Ampel-Anweisung", "kpiTileAmpel")
+        # Phase-Wert im Cyan-Akzent, damit die Karte einheitlich zum Theme passt.
+        self.lbl_phase_value.setStyleSheet("color: #00B0FF;")
+
+        tiles_row = QHBoxLayout()
+        tiles_row.setSpacing(16)
+        tiles_row.addWidget(self.tile_jump, stretch=1)
+        tiles_row.addWidget(self.tile_phase, stretch=1)
+        tiles_row.addWidget(self.tile_ampel, stretch=2)
+        dash_layout.addLayout(tiles_row)
+        root.addWidget(dash_card)
+        self._reset_dashboard()
+
+        # ---------------------------------------------------------------
+        # Zeile 5: Protokoll (fuellt die restliche Hoehe)
+        # ---------------------------------------------------------------
+        log_card, log_layout = make_card("Protokoll")
         self.log_viewer = QTextEdit()
         self.log_viewer.setReadOnly(True)
-        layout.addWidget(self.log_viewer)
+        log_layout.addWidget(self.log_viewer, stretch=1)
+        root.addWidget(log_card, stretch=1)
 
         container = QWidget()
-        container.setLayout(layout)
+        container.setLayout(root)
         self.setCentralWidget(container)
 
         # ---- 4. Timer ----
@@ -357,11 +450,46 @@ class MainWindow(QMainWindow):
                 options=[{"color": "white", "scale_factor": 1.0},
                 {"color": "white", "scale_factor": 1.5}])
             self.btn_connect.setIcon(disconnect_icon)
+            self.lbl_qira_status.setText("Verbunden")
+            self.lbl_qira_status.setStyleSheet(AMPEL_STATUS_CONNECTED)
         else:
             self.btn_connect.setStyleSheet("")
             self.btn_connect.setText("Mit Qira verbinden")
             self.btn_connect.setIcon(qta.icon("msc.link", color="white"))
             self.btn_connect.setIconSize(QSize(20, 20))
+            self.lbl_qira_status.setText("Getrennt")
+            self.lbl_qira_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
+
+    # ---- 7c. Dashboard: Kacheln aktualisieren / zuruecksetzen ----
+    def _apply_ampel_tile(self, direction):
+        """Setzt Text, Hintergrund und Textfarbe der Ampel-Kachel je Zustand."""
+        text, bg, fg = AMPEL_TILE_MAP.get(str(direction).upper(), DASHBOARD_EMPTY)
+        self.lbl_ampel_value.setText(text)
+        self.lbl_ampel_value.setStyleSheet(f"color: {fg}; background-color: transparent;")
+        self.tile_ampel.setStyleSheet(
+            f"#kpiTileAmpel {{ background-color: {bg}; border-radius: 10px; }}")
+
+    def _reset_dashboard(self):
+        """Leerzustand vor dem ersten Sprung / nach Analyse-Stopp."""
+        self.lbl_jump_value.setText("—")
+        self.lbl_phase_value.setText("—")
+        self._apply_ampel_tile("OFF")
+
+    def on_jump_update(self, payload):
+        """Aktualisiert die Dashboard-Kacheln mit den Infos zum aktuellen Sprung
+        (thread-sicher via SignalBridge aus dem Analyzer-Callback)."""
+        jump_no = payload.get("jump_no", 0)
+        phase = str(payload.get("phase", "")).lower()
+        direction = payload.get("ampel_direction", "OFF")
+
+        self.lbl_jump_value.setText(f"#{jump_no}")
+        if phase == "aufbau":
+            self.lbl_phase_value.setText("AUFBAU")
+        elif phase == "halten":
+            self.lbl_phase_value.setText("HALTEN")
+        else:
+            self.lbl_phase_value.setText("—")
+        self._apply_ampel_tile(direction)
 
     # ---- 8. Analyse-Start/Stop ----
     def start_analysis(self):
@@ -387,6 +515,7 @@ class MainWindow(QMainWindow):
             # Saubere Ausgangslage
             self.gui_last_block_id = self.client.blockID
             self.analyzer.reset()
+            self._reset_dashboard()
             self.midterm_storage = []
             self.client.blockID = 0
             # WICHTIG: manuelle Auswahl NICHT zuruecksetzen, nur erneut anwenden.
@@ -555,17 +684,22 @@ if __name__ == "__main__":
             background-color: #121214; color: #E1E1E6;
             font-family: 'Segoe UI', Helvetica, Arial, sans-serif; font-size: 10pt;
         }
+        /* Labels erben sonst den Fenster-Hintergrund und wuerden auf farbigen
+           Kacheln als dunkler Balken erscheinen. */
+        QLabel { background: transparent; }
         QPushButton#primaryButton {
             background-color: #00B0FF; color: #ffffff; font-weight: bold;
             border-radius: 6px; padding: 10px 20px; font-size: 11pt; letter-spacing: 0.5px;
         }
+        QPushButton#primaryButton:hover { background-color: #33BEFF; }
         QTextEdit {
             background-color: #1A1A1E; border: 1px solid #29292E; border-radius: 8px;
             padding: 10px; color: #00E676;
             font-family: 'Consolas', 'Courier New', monospace; font-size: 9pt;
         }
-        QFrame#athletPanel {
-            background-color: transparent; border: 1px solid #30333A; border-radius: 14px;
+        /* Einheitliche Karten-Optik fuer alle Abschnitte. */
+        QFrame#card, QFrame#athletPanel {
+            background-color: #16171B; border: 1px solid #30333A; border-radius: 14px;
         }
         QLabel#sectionTitle { color: #FFFFFF; font-size: 14pt; font-weight: bold; }
         QLabel#athletIcon { color: #00B0FF; font-size: 22px; min-width: 32px; }
@@ -574,6 +708,14 @@ if __name__ == "__main__":
             border-radius: 10px; padding: 10px 14px; font-size: 11pt;
         }
         QComboBox#athletDropdown::drop-down { border: none; width: 32px; }
+        /* Dashboard-Kacheln (KPI). */
+        QFrame#kpiTile, QFrame#kpiTileAmpel {
+            background-color: #0E1014; border: 1px solid #2A2D34; border-radius: 10px;
+        }
+        QLabel#kpiCaption {
+            color: #8A8A90; font-size: 9pt; font-weight: bold; letter-spacing: 1px;
+        }
+        QLabel#kpiValue { color: #FFFFFF; font-size: 20pt; font-weight: bold; }
     """
     app.setStyleSheet(modern_style)
 
