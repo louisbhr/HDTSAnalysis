@@ -108,21 +108,21 @@ def update_athlete_baseline(athlet_name, gold_standard_path="goldTableNeu.xlsx")
     Skala liegen wie die Gold-z-Werte (Std-basiert).
     """
     if athlet_name in ["master_session_daten", "global", "Profi-Standard (Master)"]:
-        return "Baseline-Manager: Fuer den Master-Standard wird keine lokale Baseline berechnet."
+        return "Für den Master-Standard wird keine eigene Referenz berechnet."
 
     if not os.path.exists(gold_standard_path):
-        return f"Baseline-Manager Fehler: Die Goldstandard-Datei '{gold_standard_path}' wurde nicht gefunden!"
+        return "Fehler: Goldstandard-Datei nicht gefunden."
 
     # ---- 1. Pfade definieren und Rohdaten pruefen (Quelle: <name>_all.csv, ALLE Spruenge) ----
     all_path = os.path.join("athleten_daten", f"{athlet_name}_all.csv")
     baseline_path = os.path.join("athleten_daten", f"{athlet_name}_baseline.csv")
 
     if not os.path.exists(all_path):
-        return f"Baseline-Manager: Keine Rohdaten-Historie fuer '{athlet_name}' gefunden ('{all_path}' fehlt)."
+        return f"Noch keine Aufzeichnungen für '{athlet_name}' vorhanden."
 
     df_all = pd.read_csv(all_path)
     if len(df_all) == 0:
-        return f"Baseline-Manager: '{all_path}' enthaelt keine Spruenge - keine Baseline berechnet."
+        return "Keine Sprünge aufgezeichnet – keine Referenz berechnet."
 
     # ---- 2. H_Max_robust: 95. Perzentil der Height-Spalte (robust ggue. Ausreissern) ----
     height_vals = df_all["Height"].dropna().values if "Height" in df_all.columns else np.array([])
@@ -168,13 +168,11 @@ def update_athlete_baseline(athlet_name, gold_standard_path="goldTableNeu.xlsx")
                 # Aufbau-Referenz genau falsch. Ohne gespeicherte Aufbau-Zeilen
                 # erkennt der Loader den Modus als fehlend -> Ampel nutzt im Aufbau
                 # nur das diffI-Kriterium.
-                modus_texts.append(f"aufbau: nur {mode_n} Spruenge "
-                                    f"(<{MIN_JUMPS_PER_MODE}) - kein Referenzsatz gespeichert, "
-                                    f"Ampel faehrt im Aufbau nur diffI")
+                modus_texts.append(f"Aufbau: nur {mode_n} Sprünge – kein Referenzsatz "
+                                    f"(Ampel nutzt im Aufbau nur den Höhengewinn)")
                 continue
             medians, mads, importances_raw = _gold_fallback_row_values(gold_standard_path, VAR_NAMES)
-            modus_texts.append(f"{mode}: Goldstandard-Fallback ({mode_n} Spruenge, "
-                                f"<{MIN_JUMPS_PER_MODE} benoetigt)")
+            modus_texts.append(f"{mode.capitalize()}: Standard-Referenz ({mode_n} Sprünge)")
         else:
             medians, mads = {}, {}
             for var in VAR_NAMES:
@@ -187,10 +185,10 @@ def update_athlete_baseline(athlet_name, gold_standard_path="goldTableNeu.xlsx")
                 else:
                     medians[var], mads[var] = 0.0, 1.0
 
-            importances_raw, imp_text = _hybrid_importance(
+            importances_raw, _imp_text = _hybrid_importance(
                 df_mode, VAR_NAMES, mode_n, old_importance_by_mode[mode], old_n_by_mode[mode],
                 gold_standard_path)
-            modus_texts.append(f"{mode}: {mode_n} Spruenge ({imp_text})")
+            modus_texts.append(f"{mode.capitalize()}: {mode_n} Sprünge")
 
         importances = normalize_importance(importances_raw, feature_names=VAR_NAMES, target_sum=1.0)
 
@@ -210,6 +208,5 @@ def update_athlete_baseline(athlet_name, gold_standard_path="goldTableNeu.xlsx")
     os.makedirs("athleten_daten", exist_ok=True)
     pd.DataFrame(rows_to_save).to_csv(baseline_path, index=False)
 
-    return (f"Baseline-Manager: '{baseline_path}' erfolgreich berechnet "
-            f"(H_Max_robust={h_max_robust:.2f}m [P{H_MAX_PERCENTILE}]; "
-            + "; ".join(modus_texts) + "; Importance-Summe je Modus = 1.0).")
+    return (f"Referenz aktualisiert – Besthöhe {h_max_robust:.2f} m; "
+            + "; ".join(modus_texts) + ".")

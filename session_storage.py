@@ -32,7 +32,7 @@ def save_session(raw_signal, athlet_name, fs, peak_height, peak_distance, a, b,
     """
     try:
         if raw_signal is None or len(raw_signal) == 0:
-            return None, "Session-Speicher: Keine Rohdaten vorhanden - nichts gespeichert."
+            return None, "Keine Daten vorhanden – Session nicht gespeichert."
 
         if timestamp is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -62,10 +62,10 @@ def save_session(raw_signal, athlet_name, fs, peak_height, peak_distance, a, b,
         )
 
         n_jumps = len(result["peaks"])
-        return out_path, f"Session-Speicher: Kurve mit {n_jumps} Peaks gesichert -> '{out_path}'."
+        return out_path, f"Session gespeichert ({n_jumps} Sprünge)."
 
     except Exception as e:
-        return None, f"Session-Speicher Fehler: {str(e)}"
+        return None, f"Fehler beim Speichern der Session ({str(e)})."
 
 
 def load_session(path):

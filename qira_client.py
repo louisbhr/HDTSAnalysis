@@ -59,12 +59,12 @@ class QiraClient:
         Trampolin-Buttons drueckt.
         """
         if trampoline not in ("T1", "T2", None):
-            self.logFcn(f"QiraClient: Ungueltige Trampolin-Auswahl '{trampoline}' ignoriert.")
+            self.logFcn(f"Qira: Ungültige Trampolin-Auswahl '{trampoline}' ignoriert.")
             return
         self.selected_trampoline = trampoline
         self._warned_no_selection = False
         if trampoline is not None:
-            self.logFcn(f"QiraClient: Trampolin {trampoline[-1]} manuell ausgewaehlt.")
+            self.logFcn(f"Trampolin {trampoline[-1]} gewählt.")
 
     # ---- 2. Verbindung wird eingerichtet ----
     def connect(self):
@@ -72,7 +72,7 @@ class QiraClient:
         self.thread = threading.Thread(target=self.ws.run_forever)
         self.thread.daemon = True
         self.thread.start()
-        self.logFcn("Verbindungsversuch gestartet...")
+        self.logFcn("Qira: Verbindungsversuch läuft.")
 
     # ---- 2b. Verbindungsstatus an die GUI melden ----
     def _notify_connection(self, connected):
@@ -86,11 +86,11 @@ class QiraClient:
         try:
             self.on_connection_changed(connected)
         except Exception as e:
-            self.logFcn(f"QiraClient: Fehler im Verbindungsstatus-Callback: {e}")
+            self.logFcn(f"Qira: Fehler im Verbindungs-Callback ({e}).")
 
     # ---- 3. Callback: Verbindung geoeffnet ----
     def on_open(self, ws):
-        self.logFcn("Qira ist verbunden. Bereit fuer Analyse...")
+        self.logFcn("Qira verbunden – bereit für die Analyse.")
         self._notify_connection(True)
 
     # ---- 4. Callback: Textnachricht empfangen ----
@@ -105,14 +105,14 @@ class QiraClient:
 
             # Format-Check - erwartet wird ein 48x8 Array
             if values.ndim != 2 or values.shape[1] != 8:
-                self.logFcn("Unerwartetes Datenformat von der Kraftmessplatte")
+                self.logFcn("Qira: Unerwartetes Datenformat der Kraftmessplatte.")
                 return
 
             # Ohne manuelle Auswahl werden keine Daten weitergegeben.
             if self.selected_trampoline not in ("T1", "T2"):
                 if not self._warned_no_selection:
-                    self.logFcn("QiraClient: Keine Trampolin-Auswahl gesetzt - Daten werden verworfen. "
-                                "Bitte Trampolin 1 oder 2 waehlen.")
+                    self.logFcn("Kein Trampolin gewählt – Daten werden verworfen. "
+                                "Bitte Trampolin 1 oder 2 wählen.")
                     self._warned_no_selection = True
                 return
 
@@ -127,14 +127,14 @@ class QiraClient:
             self.blockID += 1
 
         except Exception as e:
-            self.logFcn(f"Fehler bei der Live-Datenverarbeitung: {e}")
+            self.logFcn(f"Qira: Fehler bei der Live-Datenverarbeitung ({e}).")
 
     # ---- 5. Callback: Fehler ----
     def on_error(self, ws, error):
-        self.logFcn(f"Websocket Fehler: {error}")
+        self.logFcn(f"Qira: Verbindungsfehler ({error}).")
         self._notify_connection(False)
 
     # ---- 6. Callback: Verbindung geschlossen ----
     def on_close(self, ws, close_status_code, close_msg):
-        self.logFcn(f"Verbindung zu Qira geschlossen: {close_msg}")
+        self.logFcn("Qira-Verbindung getrennt.")
         self._notify_connection(False)

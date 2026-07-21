@@ -1,5 +1,6 @@
 import os
 import sys
+import html
 import subprocess
 import pandas as pd
 import numpy as np
@@ -20,6 +21,11 @@ from esp_client import AmpelClient, DEFAULT_WIFI_HOST
 from profiler import run_offline_profiler, ALL_COLUMNS, BASELINE_COLUMNS
 from baseline_manager import update_athlete_baseline
 import session_storage
+import qira_launcher
+
+# Qira-Autostart: Wartezeit (Sekunden), bis Qira im Vordergrund ist und die
+# Leertaste (Mess-Modus) sinnvoll ankommt. Am echten Laptop ggf. anpassen.
+QIRA_START_KEY_DELAY_S = 6.0
 
 # Stil fuer die Trampolin-Buttons (dunkelgrau = inaktiv, hellgrau = aktiv).
 TRAMPOLIN_STYLE_INACTIVE = (
@@ -36,6 +42,14 @@ TRAMPOLIN_STYLE_ACTIVE = (
 # Wird sowohl fuer die Ampel- als auch die Qira-Statuszeile genutzt.
 AMPEL_STATUS_DISCONNECTED = "color: #FF3B30; font-weight: bold;"
 AMPEL_STATUS_CONNECTED = "color: #00E676; font-weight: bold;"
+
+# Protokoll: Farbe je Wichtigkeit (info neutral-grau, success gruen, warning gelb, error rot).
+LOG_COLORS = {
+    "info": "#B8B8BD",
+    "success": "#00E676",
+    "warning": "#FFC107",
+    "error": "#FF5252",
+}
 
 # Dashboard: Zuordnung Ampel-Richtung -> (Anzeigetext, Kachel-Hintergrund, Textfarbe).
 # Spiegelt die ESP32-Ampel: GELB=frueher, BLAU=spaeter, GRUEN=gut, AUS=keine Ansage.
@@ -62,6 +76,9 @@ class SignalBridge(QObject):
     # Per-Sprung-Infos aus dem Analyzer (laufen im Timer/GUI-Thread, werden aber
     # ueber das Signal einheitlich thread-sicher an das Dashboard geliefert).
     jump_signal = pyqtSignal(dict)
+    # Protokollzeile aus Hintergrund-Threads (z.B. Qira-Autostart), Reihenfolge
+    # (level, text) - thread-sicher in den GUI-Thread gehoben.
+    log_level_signal = pyqtSignal(str, str)
 
 
 class MainWindow(QMainWindow):
@@ -86,6 +103,7 @@ class MainWindow(QMainWindow):
         self.bridge.log_signal.connect(self.log_message)
         self.bridge.qira_connection_signal.connect(self.on_qira_connection_changed)
         self.bridge.jump_signal.connect(self.on_jump_update)
+        self.bridge.log_level_signal.connect(self._on_bg_log)
 
         # ---- 2. Qira-Client und JumpAnalyzer ----
         self._qira_connected = False
@@ -138,10 +156,13 @@ class MainWindow(QMainWindow):
                 inner.addWidget(lbl)
             return card, inner
 
-        # ---------------------------------------------------------------
-        # Zeile 1: Verbindungen nebeneinander (bestimmt die Fensterbreite)
-        # ---------------------------------------------------------------
-        # --- Karte links: Verbindung Qira ---
+        # ===============================================================
+        # Zwei Spalten (enden unten buendig, danach breit Dashboard + Log):
+        #   LINKS  (oben->unten): Verbindung Qira, Athlet, Trampolin
+        #   RECHTS (oben->unten): Verbindung Ampel, Analyse-Button, Session-Button
+        # ===============================================================
+
+        # --- LINKS 1: Verbindung Qira (kompakt) ---
         qira_card, qira_layout = make_card("Verbindung Qira")
         self.btn_connect = QPushButton("Mit Qira verbinden")
         self.btn_connect.setObjectName("primaryButton")
@@ -152,10 +173,37 @@ class MainWindow(QMainWindow):
         self.lbl_qira_status = QLabel("Getrennt")
         self.lbl_qira_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
         qira_layout.addWidget(self.lbl_qira_status)
-        qira_layout.addStretch(1)
 
-        # --- Karte rechts: Ampel (ESP32) ---
-        ampel_card, ampel_layout = make_card("Ampel (ESP32)")
+        # --- LINKS 2: Athlet ---
+        athlet_card, athlet_layout = make_card("Athlet auswählen")
+        dropdown_row = QHBoxLayout()
+        dropdown_row.setSpacing(12)
+        athlet_icon = QLabel()
+        athlet_icon.setPixmap(qta.icon("msc.person", color="#00B0FF").pixmap(QSize(28, 28)))
+        athlet_icon.setObjectName("athletIcon")
+        athlet_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.dropdown_athleten = QComboBox()
+        self.dropdown_athleten.setObjectName("athletDropdown")
+        dropdown_row.addWidget(athlet_icon, stretch=1)
+        dropdown_row.addWidget(self.dropdown_athleten, stretch=9)
+        athlet_layout.addLayout(dropdown_row)
+
+        # --- LINKS 3: Trampolin ---
+        tramp_card, tramp_layout = make_card("Trampolin")
+        tramp_row = QHBoxLayout()
+        tramp_row.setSpacing(12)
+        self.btn_tramp1 = QPushButton("Trampolin 1")
+        self.btn_tramp2 = QPushButton("Trampolin 2")
+        self.btn_tramp1.setStyleSheet(TRAMPOLIN_STYLE_INACTIVE)
+        self.btn_tramp2.setStyleSheet(TRAMPOLIN_STYLE_INACTIVE)
+        self.btn_tramp1.clicked.connect(lambda: self.select_trampoline("T1"))
+        self.btn_tramp2.clicked.connect(lambda: self.select_trampoline("T2"))
+        tramp_row.addWidget(self.btn_tramp1)
+        tramp_row.addWidget(self.btn_tramp2)
+        tramp_layout.addLayout(tramp_row)
+
+        # --- RECHTS 1: Verbindung Ampel ---
+        ampel_card, ampel_layout = make_card("Verbindung Ampel")
 
         # Transport-Umschalter USB / WLAN + kleiner Bearbeiten-Button.
         # Normalfall: Port wird automatisch gewaehlt, IP ist voreingestellt - die
@@ -223,57 +271,11 @@ class MainWindow(QMainWindow):
         self.lbl_ampel_status = QLabel("Getrennt")
         self.lbl_ampel_status.setStyleSheet(AMPEL_STATUS_DISCONNECTED)
         ampel_layout.addWidget(self.lbl_ampel_status)
-        ampel_layout.addStretch(1)
-
-        conn_row = QHBoxLayout()
-        conn_row.setSpacing(16)
-        conn_row.addWidget(qira_card, stretch=1)
-        conn_row.addWidget(ampel_card, stretch=1)
-        root.addLayout(conn_row)
         # Ports einlesen + automatisch ersten waehlen, Infozeile/Sichtbarkeit setzen.
         self.refresh_ampel_ports()
         self._update_ampel_editor_visibility()
 
-        # ---------------------------------------------------------------
-        # Zeile 2: Setup (Athlet + Trampolin) nebeneinander
-        # ---------------------------------------------------------------
-        athlet_card, athlet_layout = make_card("Athlet auswählen")
-        dropdown_row = QHBoxLayout()
-        dropdown_row.setSpacing(12)
-        athlet_icon = QLabel()
-        athlet_icon.setPixmap(qta.icon("msc.person", color="#00B0FF").pixmap(QSize(28, 28)))
-        athlet_icon.setObjectName("athletIcon")
-        athlet_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.dropdown_athleten = QComboBox()
-        self.dropdown_athleten.setObjectName("athletDropdown")
-        dropdown_row.addWidget(athlet_icon, stretch=1)
-        dropdown_row.addWidget(self.dropdown_athleten, stretch=9)
-        athlet_layout.addLayout(dropdown_row)
-        athlet_layout.addStretch(1)
-
-        tramp_card, tramp_layout = make_card("Trampolin")
-        tramp_row = QHBoxLayout()
-        tramp_row.setSpacing(12)
-        self.btn_tramp1 = QPushButton("Trampolin 1")
-        self.btn_tramp2 = QPushButton("Trampolin 2")
-        self.btn_tramp1.setStyleSheet(TRAMPOLIN_STYLE_INACTIVE)
-        self.btn_tramp2.setStyleSheet(TRAMPOLIN_STYLE_INACTIVE)
-        self.btn_tramp1.clicked.connect(lambda: self.select_trampoline("T1"))
-        self.btn_tramp2.clicked.connect(lambda: self.select_trampoline("T2"))
-        tramp_row.addWidget(self.btn_tramp1)
-        tramp_row.addWidget(self.btn_tramp2)
-        tramp_layout.addLayout(tramp_row)
-        tramp_layout.addStretch(1)
-
-        setup_row = QHBoxLayout()
-        setup_row.setSpacing(16)
-        setup_row.addWidget(athlet_card, stretch=1)
-        setup_row.addWidget(tramp_card, stretch=1)
-        root.addLayout(setup_row)
-
-        # ---------------------------------------------------------------
-        # Zeile 3: Aktionen (Analyse starten / Session ansehen)
-        # ---------------------------------------------------------------
+        # --- RECHTS 2+3: Aktionsbuttons ---
         self.btn_analyze = QPushButton("Analyse starten")
         self.btn_analyze.setObjectName("primaryButton")
         self.btn_analyze.setIcon(qta.icon("msc.play", color="white"))
@@ -288,11 +290,35 @@ class MainWindow(QMainWindow):
         self.btn_viewer.setIconSize(QSize(20, 20))
         self.btn_viewer.clicked.connect(self.open_session_viewer)
 
-        action_row = QHBoxLayout()
-        action_row.setSpacing(16)
-        action_row.addWidget(self.btn_analyze, stretch=1)
-        action_row.addWidget(self.btn_viewer, stretch=1)
-        root.addLayout(action_row)
+        # --- Spalten zusammensetzen ---
+        left_col = QVBoxLayout()
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(16)
+        left_col.addWidget(qira_card)
+        left_col.addWidget(athlet_card)
+        left_col.addWidget(tramp_card)
+        left_col.addStretch(1)
+
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(16)
+        right_col.addWidget(ampel_card)
+        # Stretch schiebt die Aktionsbuttons an den unteren Rand, damit die rechte
+        # Spalte auf gleicher Hoehe endet wie die (hoehere) linke Spalte.
+        right_col.addStretch(1)
+        right_col.addWidget(self.btn_analyze)
+        right_col.addWidget(self.btn_viewer)
+
+        left_wrap = QWidget()
+        left_wrap.setLayout(left_col)
+        right_wrap = QWidget()
+        right_wrap.setLayout(right_col)
+
+        columns_row = QHBoxLayout()
+        columns_row.setSpacing(16)
+        columns_row.addWidget(left_wrap, stretch=1)
+        columns_row.addWidget(right_wrap, stretch=1)
+        root.addLayout(columns_row)
 
         # ---------------------------------------------------------------
         # Zeile 4: Dashboard - Schnellinfos zum aktuellen Sprung (KPI-Kacheln)
@@ -353,12 +379,75 @@ class MainWindow(QMainWindow):
         self.load_athleten_list()
         self.dropdown_athleten.currentIndexChanged.connect(self.on_athlet_changed)
 
-        self.log_message("System bereit. Bitte mit Qira verbinden und ein Trampolin waehlen...")
+        self.log_message("System bereit. Athlet und Trampolin wählen.", level="info")
+
+        # ---- 6. Qira automatisch mitstarten (UWP-App) + Mess-Modus (Leertaste) ----
+        # Laeuft im Hintergrund; danach versucht die App, sich selbststaendig mit
+        # Qira zu verbinden (mit Wiederholungen, da Qira ein paar Sekunden braucht).
+        self._qira_autoconnect_attempts = 0
+        self._qira_autoconnect_max = 12
+        self.qira_connect_timer = QTimer()
+        self.qira_connect_timer.setInterval(3000)
+        self.qira_connect_timer.timeout.connect(self._qira_autoconnect_tick)
+        self._start_qira_autostart()
+
+    # ---- 5b. Qira-Autostart + automatischer Verbindungsaufbau ----
+    def _start_qira_autostart(self):
+        """Startet Qira (Best effort) und beginnt danach den Auto-Verbindungsversuch."""
+        qira_launcher.autostart_qira(
+            log=self.bridge.log_level_signal.emit,
+            key_delay_s=QIRA_START_KEY_DELAY_S,
+        )
+        # Erst nach kurzer Wartezeit mit dem Verbinden beginnen (Qira bootet noch).
+        QTimer.singleShot(2000, self.qira_connect_timer.start)
+
+    def _qira_autoconnect_tick(self):
+        """Versucht periodisch, sich mit Qira zu verbinden, bis es klappt."""
+        if self._qira_connected:
+            self.qira_connect_timer.stop()
+            return
+        if self._qira_autoconnect_attempts >= self._qira_autoconnect_max:
+            self.qira_connect_timer.stop()
+            self.log_message("Qira nicht automatisch erreichbar – bitte manuell verbinden.",
+                             level="warning")
+            return
+        self._qira_autoconnect_attempts += 1
+        # start_connection() baut (nur wenn getrennt) einen neuen Verbindungsversuch auf.
+        self.start_connection()
 
     # ---- 6. Log ----
-    def log_message(self, text):
+    def log_message(self, text, level=None):
+        """Schreibt eine Protokollzeile, farblich nach Wichtigkeit.
+
+        level: "info" | "success" | "warning" | "error". Wird kein Level
+        uebergeben (z.B. bei Meldungen aus Sub-Modulen, die nur einen String
+        liefern), wird es heuristisch am Text erkannt.
+        """
+        if level is None:
+            level = self._detect_log_level(text)
+        color = LOG_COLORS.get(level, LOG_COLORS["info"])
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_viewer.append(f"{timestamp} >> {text}")
+        safe = html.escape(str(text))
+        self.log_viewer.append(
+            f'<span style="color:{color};">{timestamp} &nbsp;·&nbsp; {safe}</span>')
+
+    def _on_bg_log(self, level, text):
+        """Adapter: Hintergrund-Threads liefern (level, text); log_message will (text, level)."""
+        self.log_message(text, level)
+
+    @staticmethod
+    def _detect_log_level(text):
+        """Heuristische Level-Erkennung fuer Meldungen ohne explizites Level."""
+        t = str(text).lower()
+        if "fehler" in t or "fehlgeschlagen" in t or "konnte nicht" in t:
+            return "error"
+        if ("warnung" in t or "kein referenzsatz" in t or "nicht gestartet" in t
+                or "verworfen" in t or "nichts gespeichert" in t):
+            return "warning"
+        if ("verbunden" in t or "erfolgreich" in t or "gespeichert" in t
+                or "aktualisiert" in t or "bereit" in t):
+            return "success"
+        return "info"
 
     # ---- 6b. Trampolin-Auswahl ----
     def select_trampoline(self, trampoline):
@@ -390,7 +479,7 @@ class MainWindow(QMainWindow):
     def select_ampel_mode(self, mode):
         """Schaltet zwischen USB und WLAN um. Nur im getrennten Zustand moeglich."""
         if self.ampel.is_connected():
-            self.log_message("Ampel: Moduswechsel nur im getrennten Zustand moeglich.")
+            self.log_message("Ampel: Umschalten nur im getrennten Zustand möglich.", level="warning")
             return
         self.ampel_mode = mode
         self.btn_ampel_usb.setStyleSheet(
@@ -408,7 +497,7 @@ class MainWindow(QMainWindow):
         """Blendet die editierbare Port-/IP-Zeile ein bzw. aus. Bei bestehender
         Verbindung gesperrt (dann sind Port/IP ohnehin fixiert)."""
         if self.ampel.is_connected():
-            self.log_message("Ampel: Bearbeiten nur im getrennten Zustand moeglich.")
+            self.log_message("Ampel: Bearbeiten nur im getrennten Zustand möglich.", level="warning")
             return
         self.ampel_edit_mode = not self.ampel_edit_mode
         self._update_ampel_editor_visibility()
@@ -462,8 +551,8 @@ class MainWindow(QMainWindow):
         else:
             port = self.dropdown_ampel_port.currentData()
             if port is None:
-                self.log_message("Ampel: Kein COM-Port gefunden - im Bearbeiten-Modus "
-                                 "'Aktualisieren' druecken oder auf WLAN umschalten.")
+                self.log_message("Ampel: Kein USB-Port gefunden. Im Bearbeiten-Modus "
+                                 "aktualisieren oder auf WLAN umschalten.", level="warning")
                 return
             self.ampel.connect(port)
 
@@ -516,7 +605,8 @@ class MainWindow(QMainWindow):
                 if self.selected_trampoline is not None:
                     self.client.set_trampoline(self.selected_trampoline)
             except Exception as e:
-                self.log_message(f"Fehler beim Re-Initialisieren des Clients: {e}")
+                self.log_message(f"Qira: Verbindung konnte nicht vorbereitet werden ({e}).",
+                                 level="error")
                 return
 
             self.client.connect()
@@ -525,7 +615,7 @@ class MainWindow(QMainWindow):
                 try:
                     self.client.ws.close()
                 except Exception as e:
-                    self.log_message(f"Fehler beim Schliessen des Sockets: {e}")
+                    self.log_message(f"Qira: Trennen fehlgeschlagen ({e}).", level="error")
 
     # ---- 7b. Qira: Verbindungsstatus-Callback (via SignalBridge im GUI-Thread) ----
     def on_qira_connection_changed(self, connected):
@@ -543,6 +633,9 @@ class MainWindow(QMainWindow):
             self.btn_connect.setIcon(disconnect_icon)
             self.lbl_qira_status.setText("Verbunden")
             self.lbl_qira_status.setStyleSheet(AMPEL_STATUS_CONNECTED)
+            # Verbindung steht -> automatische Wiederholversuche beenden.
+            if hasattr(self, "qira_connect_timer"):
+                self.qira_connect_timer.stop()
         else:
             self.btn_connect.setStyleSheet("")
             self.btn_connect.setText("Mit Qira verbinden")
@@ -595,7 +688,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Keine Trampolin-Auswahl",
                                     "Bitte zuerst Trampolin 1 oder Trampolin 2 auswaehlen, "
                                     "bevor die Analyse gestartet wird.")
-                self.log_message("WARNUNG: Analyse nicht gestartet - kein Trampolin ausgewaehlt.")
+                self.log_message("Analyse nicht gestartet: kein Trampolin gewählt.",
+                                 level="warning")
                 return
 
             self.btn_analyze.setStyleSheet(
@@ -622,8 +716,8 @@ class MainWindow(QMainWindow):
             self.timer.start()
             # Ampel: Status-LED auf "Analyse laeuft" (gruen); ohne Verbindung wirkungslos.
             self.ampel.set_analysis(True)
-            self.log_message(f"Analyse gestartet (Trampolin {self.selected_trampoline[-1]}). "
-            f"Warte auf Daten von Qira...")
+            self.log_message(f"Analyse gestartet – Trampolin {self.selected_trampoline[-1]}. "
+                             f"Warte auf Daten von Qira.", level="success")
         else:
             self.btn_analyze.setStyleSheet("")
             self.btn_analyze.setText("Analyse starten")
@@ -634,7 +728,7 @@ class MainWindow(QMainWindow):
             # Ampel: Status-LED zurueck auf "UI verbunden" (gelb), Anzeige leeren.
             self.ampel.set_analysis(False)
             self.ampel.display_off()
-            self.log_message("Analyse gestoppt.")
+            self.log_message("Analyse gestoppt.", level="info")
             # Nach dem Stoppen wieder anhand der Vorbedingungen freigeben/sperren.
             self._update_analyze_enabled()
 
@@ -642,7 +736,7 @@ class MainWindow(QMainWindow):
                 # Gemeinsamer Zeitstempel fuer CSV und Session-Datei.
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-                self.log_message("Verarbeite Gesamtaufzeichnung im Hintergrund-Profiler...")
+                self.log_message("Werte Aufzeichnung aus …", level="info")
                 status_meldung = run_offline_profiler(
                     raw_signal=self.midterm_storage,
                     athlet_name=athlet_name,
@@ -670,10 +764,10 @@ class MainWindow(QMainWindow):
                 self.midterm_storage = []
 
                 if selected_data != "global":
-                    self.log_message("Aktualisiere Athleten-Baseline und Feature Importance...")
+                    self.log_message("Aktualisiere Athleten-Referenz …", level="info")
                     self.log_message(update_athlete_baseline(athlet_name))
             else:
-                self.log_message("Keine Daten im midterm_storage gefunden.")
+                self.log_message("Keine Sprungdaten aufgezeichnet.", level="warning")
 
     # ---- 8b. Session-Viewer oeffnen ----
     def open_session_viewer(self):
@@ -688,9 +782,9 @@ class MainWindow(QMainWindow):
         viewer = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_viewer.py")
         try:
             subprocess.Popen([sys.executable, viewer, path])
-            self.log_message(f"Session-Viewer geoeffnet fuer: {os.path.basename(path)}")
+            self.log_message(f"Session-Viewer geöffnet: {os.path.basename(path)}", level="info")
         except Exception as e:
-            self.log_message(f"Fehler beim Oeffnen des Viewers: {e}")
+            self.log_message(f"Session-Viewer konnte nicht geöffnet werden ({e}).", level="error")
 
     # ---- 8c. Sauberes Beenden ----
     def closeEvent(self, event):
@@ -759,7 +853,7 @@ class MainWindow(QMainWindow):
                     if not os.path.exists(all_path):
                         pd.DataFrame(columns=ALL_COLUMNS).to_csv(all_path, index=False)
 
-                    self.log_message(f"Profil fuer '{name}' wurde erfolgreich angelegt.")
+                    self.log_message(f"Athlet '{name}' angelegt.", level="success")
                     self.load_athleten_list()
                     idx = self.dropdown_athleten.findText(clean_name)
                     if idx >= 0:
@@ -767,7 +861,7 @@ class MainWindow(QMainWindow):
             else:
                 self.dropdown_athleten.setCurrentIndex(0)
         else:
-            self.log_message(f"Profil gewechselt zu: {self.dropdown_athleten.currentText()}")
+            self.log_message(f"Athlet gewählt: {self.dropdown_athleten.currentText()}", level="info")
 
 
 if __name__ == "__main__":

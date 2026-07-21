@@ -5,7 +5,7 @@ from scipy.signal import butter, lfilter, lfilter_zi, find_peaks
 from scipy.integrate import trapezoid
 
 from importance_utils import (
-    normalize_importance, compute_jump_score, step_label, format_debug_table,
+    normalize_importance, compute_jump_score, step_label,
     DEADBAND_TREND, CONSISTENCY_GATE, determine_phase,
 )
 
@@ -128,7 +128,7 @@ class JumpAnalyzer:
                 gold_ordered["GoldMean"], gold_ordered["GoldStd"], gold_ordered["Importance"])
             return mode, 4.5
         except Exception as e:
-            logFcn(f"JumpAnalyzer: KRITISCHER FEHLER beim Excel-Laden. Lokaler Not-Fallback aktiv! {e}")
+            logFcn(f"Fehler beim Laden des Goldstandards – Not-Referenz aktiv ({e}).")
             medians = {"Peak_t": 0.2, "Peak_Prct": 50, "Explosiv": 15000,
                        "preSlope": 50000, "postSlope": -50000, "Symmetry": 1.0}
             mads = {"Peak_t": 0.02, "Peak_Prct": 5, "Explosiv": 2000,
@@ -156,9 +156,8 @@ class JumpAnalyzer:
             try:
                 df_base = pd.read_csv(baseline_path)
                 if "Mode" not in df_base.columns:
-                    logFcn(f"JumpAnalyzer: Baseline fuer '{athlet_name}' im alten Format (ohne "
-                    f"'Mode'-Spalte) gefunden - wird als Modus 'halten' interpretiert. "
-                    f"Baseline sollte neu berechnet werden (Athleten-Baseline aktualisieren).")
+                    logFcn(f"Athlet-Referenz '{athlet_name}' im alten Format – als Halten "
+                           f"übernommen. Bitte einmal neu aufzeichnen zum Aktualisieren.")
                     df_base = df_base.copy()
                     df_base["Mode"] = "halten"
 
@@ -178,8 +177,8 @@ class JumpAnalyzer:
                         if len(h_max_vals) > 0 and h_max is None:
                             h_max = float(h_max_vals.iloc[0])
             except Exception as e:
-                logFcn(f"JumpAnalyzer: Fehler beim Laden der Baseline von {athlet_name}. "
-                f"Weiche auf Goldstandard aus. Fehler: {e}")
+                logFcn(f"Fehler beim Laden der Referenz von '{athlet_name}' – "
+                       f"nutze Goldstandard ({e}).")
                 profiles, mode_sources = {}, {}
 
         if "aufbau" not in profiles or "halten" not in profiles:
@@ -195,9 +194,11 @@ class JumpAnalyzer:
         self.mode_sources = dict(mode_sources)
         self.h_max = h_max if h_max is not None else 4.5
 
-        logFcn(f"JumpAnalyzer: Profil fuer '{athlet_name}' geladen "
-        f"(aufbau: {mode_sources.get('aufbau', '?')}, halten: {mode_sources.get('halten', '?')}, "
-        f"H_Max: {self.h_max:.2f}m, Importance-Summe je Modus normiert auf 1.0).")
+        src_txt = {"individuelle Baseline": "individuell", "Goldstandard": "Standard"}
+        a_src = src_txt.get(mode_sources.get("aufbau"), "Standard")
+        h_src = src_txt.get(mode_sources.get("halten"), "Standard")
+        logFcn(f"Referenz für '{athlet_name}' geladen – Aufbau: {a_src}, "
+               f"Halten: {h_src}, Besthöhe {self.h_max:.2f} m.")
 
     # ---- 2b. Ampel (ESP32) anbinden ----
     def set_ampel_client(self, client):
@@ -408,8 +409,6 @@ class JumpAnalyzer:
             # ~ 4.4 Phasen-Weiche + Coaching-Logik ~
             h_previous = self._h_previous_for_jump(next_jump_idx, left)
             phase = determine_phase(h_previous, self.h_max)
-            if h_previous is not None:
-                logFcn(f"Phase '{phase}' (h_previous={h_previous:.2f}m, H_Max={self.h_max:.2f}m).")
 
             current_features = {
                 "Peak_t": peak_t, "Peak_Prct": peak_prct, "Explosiv": explosiv,
@@ -435,35 +434,30 @@ class JumpAnalyzer:
 
             self.total_jump_count += 1
 
+            # Klartext-Rueckmeldung je Phase (eine verstaendliche Zeile pro Sprung).
             if phase == "halten":
+                phase_label = "Halten"
                 if abs(trend_score) < DEADBAND_TREND:
-                    coaching_output = "Timing stabil - gut!"
-                    logFcn(f"Sprung #{self.total_jump_count} erkannt! [halten] {coaching_output} "
-                    f"(Trend-Score: {trend_score:+.3f}, Absolut-Score: {abs_score:.3f})")
+                    coaching_output = "Timing stabil"
                 else:
                     consistency = (abs(trend_score) / abs_score) if abs_score > 0.0 else 0.0
                     if consistency > CONSISTENCY_GATE:
-                        step = step_label(abs_score)
-                        direction_txt = "frueher treten" if trend_score > 0 else "spaeter treten"
-                        coaching_output = f"Athlet muss {step} {direction_txt}"
-                        logFcn(f"Sprung #{self.total_jump_count} erkannt! [halten] Coaching: {coaching_output}\n"
-                        f"   Trend-Score (mit Richtung): {trend_score:+.3f} | "
-                        f"Absolut-Score (Abweichung): {abs_score:.3f} | Konsistenz: {consistency:.2f}")
+                        direction_txt = "früher treten" if trend_score > 0 else "später treten"
+                        coaching_output = f"{step_label(abs_score)} {direction_txt}"
                     else:
                         coaching_output = "Abweichung uneinheitlich"
-                        debug_table = format_debug_table(result["details"])
-                        logFcn(f"Sprung #{self.total_jump_count} erkannt! [halten] {coaching_output}\n"
-                        f"   Trend-Score (mit Richtung): {trend_score:+.3f} | "
-                        f"Absolut-Score (Abweichung): {abs_score:.3f} | Konsistenz: {consistency:.2f}\n{debug_table}")
             else:  # phase == "aufbau": keine Timing-Bewertung, output-orientierte Rueckmeldung.
+                phase_label = "Aufbau"
                 if not np.isfinite(diffI):
-                    coaching_output = "Erster Sprung erfasst - weiter so!"
+                    coaching_output = "erster Sprung"
                 elif diffI > AUFBAU_DIFFI_THRESHOLD:
-                    coaching_output = "Guter Druck - Hoehe kommt!"
+                    coaching_output = "Höhe kommt"
                 else:
-                    coaching_output = "Mehr Druck ins Tuch"
-                logFcn(f"Sprung #{self.total_jump_count} erkannt! [aufbau] {coaching_output} "
-                f"(diffI: {diffI:.1f}, Score nur geloggt - Trend: {trend_score:+.3f}, Abs: {abs_score:.3f})")
+                    coaching_output = "mehr Druck ins Tuch"
+
+            # Eine Zeile pro Sprung: Nr. · Phase · Klartext (kompakte Kennzahl in Sigma).
+            logFcn(f"Sprung {self.total_jump_count} · {phase_label} · {coaching_output} "
+                   f"(Abweichung {abs_score:.1f}σ)")
 
             self.data["coaching"].append(coaching_output)
 
@@ -480,7 +474,7 @@ class JumpAnalyzer:
                     try:
                         self.ampel_client.send_state(led_direction, led_level)
                     except Exception as e:
-                        logFcn(f"Ampel: Sendefehler aus dem Analyzer ({e}).")
+                        logFcn(f"Ampel: Senden fehlgeschlagen ({e}).")
 
             # ~ 4.6 Live-Dashboard (GUI): Schnellinfos zum aktuellen Sprung ~
             # Laeuft immer (auch ohne Ampel-Client / ohne classify_ampel); Fehler

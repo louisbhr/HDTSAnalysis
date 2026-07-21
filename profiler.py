@@ -66,7 +66,7 @@ def analyze_raw_signal(raw_signal, fs, peak_height, peak_distance, a, b):
     }
 
     if signal_array.size < 2:
-        empty["message"] = "Profiler: Signal zu kurz fuer eine Analyse."
+        empty["message"] = "Aufzeichnung zu kurz für eine Auswertung."
         return empty
 
     # ---- 1. Filtern, Peaks, Kontaktphasen ----
@@ -76,7 +76,7 @@ def analyze_raw_signal(raw_signal, fs, peak_height, peak_distance, a, b):
 
     if len(peaks) == 0:
         empty["filtered_signal"] = filt_sig
-        empty["message"] = "Profiler: Keine Spruenge in den Rohdaten gefunden."
+        empty["message"] = "Keine Sprünge in der Aufzeichnung gefunden."
         return empty
 
     left_idx, right_idx = [], []
@@ -330,7 +330,7 @@ def run_offline_profiler(raw_signal, athlet_name, fs, peak_height, peak_distance
 
         jumps = result["jumps"]
         if len(jumps) == 0:
-            return "Profiler: Keine validen Spruenge gefunden. Nichts gespeichert."
+            return "Keine gültigen Sprünge gefunden – nichts gespeichert."
 
         from datetime import datetime
         if timestamp is None:
@@ -374,9 +374,8 @@ def run_offline_profiler(raw_signal, athlet_name, fs, peak_height, peak_distance
         if good_count > 0:
             _append_with_schema(base_path, pd.DataFrame(good_rows), BASELINE_COLUMNS)
 
-        return (f"Profiler: {len(jumps)} valide Spruenge in '{all_path}' gesichert "
-                f"({good_count} davon hochwertig (HG>{HG_QUALITY_THRESHOLD}m) fuer die Baseline). "
-                f"Score-Referenz: {score_mode} (alte <name>.csv: {n_existing} Spruenge).")
+        return (f"{len(jumps)} Sprünge gespeichert "
+                f"({good_count} für die Referenz geeignet).")
 
     except Exception as e:
-        return f"Fehler im Offline-Profiler-Modul: {str(e)}"
+        return f"Fehler bei der Auswertung ({str(e)})."
