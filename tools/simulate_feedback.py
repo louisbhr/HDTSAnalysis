@@ -25,6 +25,7 @@ Aufruf:
 oder ein Athletenname, falls eine Baseline unter athleten_daten/ existiert).
 """
 import os
+import re
 import sys
 import glob
 import argparse
@@ -35,7 +36,8 @@ import pandas as pd
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from importance_utils import compute_jump_score
+from importance_utils import (compute_jump_score, DEADBAND_TREND, DIFFI_DEADBAND,
+                              ROLL_N, MIN_ROLL)
 import jump_analyzer as jump_analyzer_module
 import profiler
 
@@ -75,12 +77,48 @@ def _rows_from_dataframe(df):
     return rows
 
 
+# Einheiten-Suffix im Spaltennamen: "Peak_t [s]" -> "Peak_t", "Höhe [m]" -> "Höhe"
+_UNIT_SUFFIX = re.compile(r"\s*\[[^\]]*\]\s*$")
+_COLUMN_ALIASES = {"Höhe": "Height", "Hoehe": "Height"}
+# Spalten, nach denen sinnvoll gruppiert werden kann (erste Treffer gewinnt).
+GROUP_CANDIDATES = ("Athlet", "Serie", "Person", "Athlete")
+
+
+def _normalize_columns(df):
+    """Entfernt Einheiten-Suffixe und mappt deutsche Spaltennamen auf die internen."""
+    ren = {}
+    for c in df.columns:
+        name = _UNIT_SUFFIX.sub("", str(c)).strip()
+        ren[c] = _COLUMN_ALIASES.get(name, name)
+    return df.rename(columns=ren)
+
+
+def load_frame(path):
+    """Liest .csv/.xlsx als DataFrame mit normalisierten Spaltennamen.
+
+    Die Validierungstabelle hat eine ZWEIZEILIGE Kopfzeile (Gruppen HDTS/Video/Knie
+    ueber den echten Namen); deshalb wird Kopfzeile 0 und 1 probiert und die genommen,
+    in der die Score-Features auftauchen.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    last = None
+    for header in (0, 1):
+        if ext == ".csv":
+            df = _normalize_columns(pd.read_csv(path, header=header))
+        else:
+            df = _normalize_columns(pd.read_excel(path, header=header))
+        if all(f in df.columns for f in SCORE_FEATURES):
+            return df
+        last = df
+    return last   # nichts gefunden -> _rows_from_dataframe wirft die klare Fehlermeldung
+
+
 def load_csv(path):
-    return _rows_from_dataframe(pd.read_csv(path))
+    return _rows_from_dataframe(load_frame(path))
 
 
 def load_xlsx(path):
-    return _rows_from_dataframe(pd.read_excel(path))
+    return _rows_from_dataframe(load_frame(path))
 
 
 def load_npz(path):
@@ -109,6 +147,31 @@ def load_rows(path):
     raise ValueError(f"Unbekannte Endung: {ext}")
 
 
+def load_groups(path, group_by="auto"):
+    """Liefert [(gruppenname|None, rows), ...] - je Gruppe eine eigene Simulation.
+
+    Wichtig fuer die Korrektheit: jede Gruppe bekommt spaeter einen EIGENEN Analyzer,
+    damit die Rolling-Referenz nicht ueber Athletengrenzen mischt. Die Zwischen-
+    Athleten-Streuung ist laut Uebergabe 3.7 das 2.6- bis 10.4-Fache der Within-
+    Streuung; ein vermischtes Fenster mittelt ueber fremde Koerper und verschiebt
+    trend und abs systematisch. Auch HG/diffI werden so je Gruppe differenziert und
+    nicht ueber den Wechsel hinweg.
+    """
+    if os.path.splitext(path)[1].lower() == ".npz":
+        return [(None, load_npz(path))]
+
+    df = load_frame(path)
+    col = None
+    if group_by == "auto":
+        col = next((c for c in GROUP_CANDIDATES if c in df.columns), None)
+    elif group_by:
+        col = group_by if group_by in df.columns else None
+    if col is None:
+        return [(None, _rows_from_dataframe(df))]
+    return [(str(key), _rows_from_dataframe(grp))
+            for key, grp in df.groupby(col, sort=False)]
+
+
 # --------------------------------------------------------------------------- #
 #  Entscheidungssimulation (nutzt die echten Produktionspfade)
 # --------------------------------------------------------------------------- #
@@ -124,7 +187,6 @@ def simulate(rows, profile="global"):
     a.load_profile(profile, logFcn=lambda *_: None)
     a.reset()
     a.load_profile(profile, logFcn=lambda *_: None)  # reset() laesst Profil unberuehrt; sicherheitshalber
-    aufbau_ok = (a.mode_sources.get("aufbau") == "individuelle Baseline")
 
     records = []
     prev_hg = None
@@ -146,9 +208,12 @@ def simulate(rows, profile="global"):
             feature_order=a.var_names,
         )
         trend, absx = result["trend_score"], result["abs_score"]
+        # Wie im Live-Pfad: Richtung nur gegen die EIGENE Referenz (Rolling-Fenster
+        # oder individuelle Baseline); gegen Gold zeigt die Ampel GRUEN.
+        ref_is_own = bool(ref.get("is_own", True))
         direction, level, text = decide_feedback(
             trend, absx, phase=phase, diffI=row.get("diffI", np.nan),
-            aufbau_reference_ok=aufbau_ok)
+            aufbau_reference_ok=ref_is_own, reference_is_own=ref_is_own)
 
         records.append({"phase": phase, "direction": direction, "level": level,
                         "trend": trend, "abs": absx, "text": text})
@@ -230,7 +295,9 @@ def print_report(label, s):
     print(f"  Leuchtquote (Licht an): {s['lit_pct']:.0f}%")
     print(f"  Halten (n={s['hal_n']}): gruen {s['hal_good']:.0f}% | gelb {s['hal_early']:.0f}%"
           f" | blau {s['hal_late']:.0f}% | aus {s['hal_off']:.0f}%")
-    print(f"  Aufbau (n={s['auf_n']}): Hoehe kommt {s['auf_good']:.0f}% | Richtung {s['auf_dir']:.0f}%"
+    # "gruen" statt "Hoehe kommt": GRUEN deckt im Aufbau mehrere Faelle ab
+    # (Hoehengewinn, erster Sprung, Gold-Warmstart).
+    print(f"  Aufbau (n={s['auf_n']}): gruen {s['auf_good']:.0f}% | Richtung {s['auf_dir']:.0f}%"
           f" | aus {s['auf_off']:.0f}%")
     print(f"  trend: Median {s['trend_median']:+.2f}, {s['trend_neg_pct']:.0f}% negativ"
           f"  |  abs: Median {s['abs_median']:.2f}")
@@ -243,7 +310,12 @@ def main():
     ap.add_argument("--live-check", action="store_true",
                     help="Fuer .npz zusaetzlich den echten Live-Pfad gegenpruefen")
     ap.add_argument("--csv", default=None, help="Kennzahlen zusaetzlich als CSV-Zeilen hierhin")
+    ap.add_argument("--group-by", default="auto",
+                    help="Spalte, bei der die Referenz neu startet (Default: auto -> "
+                         "Athlet/Serie, falls vorhanden; 'none' schaltet die Trennung ab)")
     args = ap.parse_args()
+    if str(args.group_by).lower() in ("none", "off", ""):
+        args.group_by = None
 
     # Pfade absolut aufloesen, dann ins Repo wechseln, damit load_profile die
     # goldTableNeu.xlsx und Athleten-Baselines unter athleten_daten/ findet.
@@ -261,19 +333,53 @@ def main():
         print("Keine passenden Dateien (.csv/.xlsx/.npz) gefunden.")
         return 1
 
+    # "<name>.csv" ist die auf HG > HG_QUALITY_THRESHOLD gefilterte Baseline-Teilmenge
+    # von "<name>_all.csv": reine Lade-Kontakte, keine Session. Wer sie mitzaehlt, zaehlt
+    # dieselben Spruenge doppelt UND zieht den Schnitt nach oben (Aufbau-Paradox). Liegt
+    # das Gegenstueck daneben, wird die gefilterte Datei uebersprungen.
+    stems = {os.path.splitext(f)[0] for f in files}
+    skipped = [f for f in files if f.lower().endswith(".csv")
+               and os.path.splitext(f)[0] + "_all" in stems]
+    files = [f for f in files if f not in skipped]
+
+    print("=" * 74)
+    print(f"Warmstart-Profil: {args.profile}   |   Gruppierung: {args.group_by or 'aus'}")
+    print(f"Konstanten: DEADBAND_TREND={DEADBAND_TREND}  DIFFI_DEADBAND={DIFFI_DEADBAND}"
+          f"  ROLL_N={ROLL_N}  MIN_ROLL={MIN_ROLL}")
+    print(f"Ausgewertete Dateien ({len(files)}):")
+    for f in files:
+        print(f"    {os.path.relpath(f, REPO_ROOT)}")
+    for f in skipped:
+        print(f"  ! uebersprungen (gefilterte Baseline-Teilmenge): {os.path.basename(f)}")
+    print("=" * 74)
+
     all_records = []
     csv_rows = []
     for path in files:
-        label = os.path.basename(path)
+        base = os.path.basename(path)
         try:
-            rows = load_rows(path)
-            records = simulate(rows, profile=args.profile)
+            groups = load_groups(path, group_by=args.group_by)
         except Exception as e:
-            print(f"\n=== {label} ===\n  FEHLER: {e}")
+            print(f"\n=== {base} ===\n  FEHLER: {e}")
             continue
+
+        records = []
+        for gname, rows in groups:
+            label = base if gname is None else f"{base} · {gname}"
+            try:
+                grp_records = simulate(rows, profile=args.profile)
+            except Exception as e:
+                print(f"\n=== {label} ===\n  FEHLER: {e}")
+                continue
+            records.extend(grp_records)
+            s = summarize(grp_records)
+            print_report(label, s)
+            if args.csv is not None:
+                csv_rows.append({"file": label, **s})
+
+        if len(groups) > 1 and records:
+            print_report(f"{base} — alle Gruppen zusammen", summarize(records))
         all_records.extend(records)
-        s = summarize(records)
-        print_report(label, s)
 
         if args.live_check and path.lower().endswith(".npz"):
             try:
@@ -289,11 +395,8 @@ def main():
             except Exception as e:
                 print(f"  live-check FEHLER: {e}")
 
-        if args.csv is not None:
-            csv_rows.append({"file": label, **s})
-
-    if len(files) > 1:
-        print_report("GESAMT (alle Dateien)", summarize(all_records))
+    if len(csv_rows) > 1 or len(files) > 1:
+        print_report(f"GESAMT ({len(files)} Datei(en))", summarize(all_records))
 
     if args.csv is not None and csv_rows:
         pd.DataFrame(csv_rows).to_csv(args.csv, index=False)

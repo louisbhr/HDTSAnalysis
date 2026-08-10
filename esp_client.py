@@ -88,7 +88,7 @@ def _direction_text(direction, level):
 
 
 def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
-                    aufbau_reference_ok=True):
+                    aufbau_reference_ok=True, reference_is_own=True):
     """EINE Entscheidung fuer LED **und** Log-Text (behebt die fruehere Divergenz).
 
     Rueckgabe: (direction, level, text)
@@ -114,6 +114,16 @@ def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
     Steady-State-Kontakte und waere als Aufbau-Referenz genau falsch. Daher NUR
     das diffI-Kriterium (GOOD bei diffI > Totband, sonst OFF), Richtungslichter
     erst wenn die Aufbau-Baseline steht.
+
+    reference_is_own=False (Gold-Warmstart, beide Phasen): Solange die eigene
+    Referenz noch entsteht, ist das Profi-Muster ein FREMDER Koerper. Eine
+    Richtungsansage dagegen ist systematisch falsch - gegen Gold liegt trend
+    konstant bei +1.2 bis +2.6 Sigma bei Konsistenz ~1, also faellt praktisch
+    jeder Sprung auf "frueher treten" (Uebergabe 5.1.3). Empirisch belegt: in 5
+    von 7 Athletendateien waren es exakt MIN_ROLL = 6 GELB-Spruenge im Halten,
+    genau die Kontakte vor dem Fuellen des Rolling-Fensters. Deshalb hier GRUEN
+    statt einer Richtung - und GRUEN statt AUS, damit die Ampel von der ersten
+    Landung an sichtbar etwas anzeigt und nicht defekt wirkt.
     """
     try:
         abs_score = float(abs_score)
@@ -122,6 +132,17 @@ def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
         return ("OFF", 0, "kein Signal")
     if not (math.isfinite(abs_score) and math.isfinite(trend_score)):
         return ("OFF", 0, "kein Signal")
+
+    # --- Gold-Warmstart: keine Richtung, aber sichtbar GRUEN (siehe Docstring) ---
+    if not reference_is_own:
+        if str(phase).lower() == "aufbau":
+            try:
+                diffI_val = float(diffI)
+            except (TypeError, ValueError):
+                diffI_val = float("nan")
+            if math.isfinite(diffI_val) and diffI_val > DIFFI_DEADBAND:
+                return ("GOOD", 0, "Höhe kommt")
+        return ("GOOD", 0, "Referenz wird aufgebaut")
 
     if str(phase).lower() == "aufbau":
         try:
@@ -134,7 +155,9 @@ def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
         if not aufbau_reference_ok:
             return ("OFF", 0, "kein Signal")
         if not math.isfinite(diffI_val):
-            return ("OFF", 0, "erster Sprung")
+            # Erster Kontakt: diffI braucht einen Vorgaenger. Kein Grund fuer AUS -
+            # die Ampel soll ab der ersten Landung sichtbar sein.
+            return ("GOOD", 0, "erster Sprung")
         if abs(trend_score) < DEADBAND_TREND:
             return ("OFF", 0, "mehr Druck ins Tuch")
         direction, level = _direction_state(trend_score, abs_score)

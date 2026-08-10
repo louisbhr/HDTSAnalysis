@@ -193,13 +193,19 @@ class JumpAnalyzer:
                     dev[f] = mad if mad > 0 else 1e-6
                 else:
                     ref[f], dev[f] = 0.0, 1.0
+            # Rolling: die Referenz besteht aus Kontakten DIESER Session, also aus
+            # dem eigenen Koerper -> Richtungsansagen sind hier gueltig.
             return {"reference": ref,
                     "deviation": self._apply_mad_floor(dev),
-                    "importance_dict": stored["importance_dict"]}
-        # Warmstart: gespeicherte Baseline, aber mit MAD-Floor.
+                    "importance_dict": stored["importance_dict"],
+                    "is_own": True}
+        # Warmstart: gespeicherte Baseline, aber mit MAD-Floor. Nur wenn diese
+        # Baseline individuell ist, beschreibt sie den eigenen Koerper; steht dort
+        # der Goldstandard, ist sie ein fremdes Muster und traegt keine Richtung.
         return {"reference": stored["reference"],
                 "deviation": self._apply_mad_floor(dict(stored["deviation"])),
-                "importance_dict": stored["importance_dict"]}
+                "importance_dict": stored["importance_dict"],
+                "is_own": self.mode_sources.get(phase) == "individuelle Baseline"}
 
     # ---- 1d. Live-Phase aus der HG-Dynamik (asymmetrische Hysterese) ----
     def _update_phase_from_hg(self):
@@ -530,11 +536,18 @@ class JumpAnalyzer:
 
             # EINE Entscheidung fuer Text UND LED (keine Divergenz mehr). Richtungslichter
             # im Aufbau nur gegen eine INDIVIDUELLE Aufbau-Baseline (Gold waere falsch).
-            aufbau_ok = (self.mode_sources.get("aufbau") == "individuelle Baseline")
+            # Richtungslichter setzen eine EIGENE Referenz voraus: entweder das
+            # gefuellte Rolling-Fenster dieser Session oder eine individuelle
+            # gespeicherte Baseline. Gegen den Goldstandard (fremder Koerper) zeigt
+            # die Ampel stattdessen GRUEN, bis die eigene Referenz steht. Das gilt
+            # fuer beide Phasen und ersetzt die frueher nur an der gespeicherten
+            # Aufbau-Baseline haengende Sperre.
+            ref_is_own = bool(mode_profile.get("is_own", True))
             if decide_feedback is not None:
                 direction, level, coaching_output = decide_feedback(
                     trend_score, abs_score, phase=phase, diffI=diffI,
-                    aufbau_reference_ok=aufbau_ok)
+                    aufbau_reference_ok=ref_is_own,
+                    reference_is_own=ref_is_own)
             else:
                 direction, level, coaching_output = ("OFF", 0, "kein Signal")
             self.last_ampel_state = (direction, level)

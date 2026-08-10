@@ -196,9 +196,10 @@ def test_ampel_logic():
           "GOOD", 0, "Höhe kommt")
     check(((2.0, 2.5), dict(phase="aufbau", diffI=LOW_DIFFI, aufbau_reference_ok=False)),
           "OFF", 0, "kein Signal")
-    # Erster Sprung (diffI = NaN) mit Baseline -> AUS "erster Sprung".
+    # Erster Sprung (diffI = NaN) mit Baseline -> GRUEN "erster Sprung". Bewusst kein
+    # AUS: die Ampel soll ab der ersten Landung sichtbar sein, nicht defekt wirken.
     check(((1.0, 1.2), dict(phase="aufbau", diffI=float("nan"), aufbau_reference_ok=True)),
-          "OFF", 0, "erster Sprung")
+          "GOOD", 0, "erster Sprung")
 
     print("  OK: 8 Zweige (4 je Phase) + Aufbau-Fallback, Text passt jeweils zur LED.")
 
@@ -274,6 +275,54 @@ def test_rolling_reference_and_mad_floor():
     print("  OK: Warmstart<MIN_ROLL, danach Rolling; MAD-Floor = 0.30*GoldStd greift.")
 
 
+def test_gold_warmstart_green():
+    """(j) Gold-Warmstart: GRUEN statt Richtung und statt AUS.
+
+    Empirischer Anlass: in 5 von 7 Athletendateien waren es exakt MIN_ROLL = 6
+    GELB-Spruenge im Halten - genau die Kontakte vor dem Fuellen des Rolling-
+    Fensters, gescort gegen den Goldstandard (Uebergabe 5.1.3).
+    """
+    from esp_client import decide_feedback
+    from importance_utils import MIN_ROLL, DIFFI_DEADBAND
+
+    # Gegen Gold: nie eine Richtung und nie AUS - auch bei grossem Trend.
+    for trend in (2.5, -2.5, 0.1):
+        for phase in ("halten", "aufbau"):
+            d, lvl, _ = decide_feedback(trend, 2.6, phase=phase, diffI=-5.0,
+                                        reference_is_own=False)
+            assert (d, lvl) == ("GOOD", 0), (phase, trend, d, lvl)
+
+    # Hoehengewinn schlaegt auch waehrend des Warmstarts durch.
+    d, _, txt = decide_feedback(2.5, 2.6, phase="aufbau",
+                                diffI=DIFFI_DEADBAND + 10.0, reference_is_own=False)
+    assert (d, txt) == ("GOOD", "Höhe kommt"), (d, txt)
+
+    # Mit eigener Referenz kommt die Richtung zurueck (sonst waere alles Dauergruen).
+    assert decide_feedback(2.5, 2.6, phase="halten", reference_is_own=True)[0] == "EARLY"
+
+    # Der Analyzer muss die Herkunft der Referenz korrekt melden.
+    var_names = ["Peak_t", "Peak_Prct", "Explosiv", "preSlope", "postSlope", "Symmetry"]
+    a = jump_analyzer_module.JumpAnalyzer()
+    a._gold_std = {v: 10.0 for v in var_names}
+    a.profiles["halten"] = {
+        "reference": {v: 100.0 for v in var_names},
+        "deviation": {v: 5.0 for v in var_names},
+        "importance_dict": {v: 1.0 / len(var_names) for v in var_names},
+    }
+    a._roll["halten"].clear()
+    a.mode_sources = {"halten": "Goldstandard"}
+    assert a._reference_for("halten")["is_own"] is False, "Gold-Warmstart ist NICHT der eigene Koerper."
+    for _ in range(MIN_ROLL):
+        a._roll["halten"].append({v: 50.0 for v in var_names})
+    assert a._reference_for("halten")["is_own"] is True, "Gefuelltes Rolling-Fenster ist der eigene Koerper."
+    a._roll["halten"].clear()
+    a.mode_sources = {"halten": "individuelle Baseline"}
+    assert a._reference_for("halten")["is_own"] is True, "Individuelle Baseline traegt den Warmstart."
+
+    print("  OK: Gold-Warmstart zeigt GRUEN (nie Richtung, nie AUS); "
+          "eigene Referenz schaltet die Richtung frei.")
+
+
 def test_aufbau_fallback_pipeline():
     """(f) Zu wenig Aufbau-Spruenge: keine Aufbau-Zeilen in der Baseline-CSV,
     Analyzer erkennt den fehlenden Modus als Goldstandard-Quelle."""
@@ -335,6 +384,7 @@ def main():
         ("g) diffI-Totband (Aufbau-GRUEN)", test_diffi_deadband),
         ("h) HG-Phasenerkennung mit Hysterese", test_hysterese_phase),
         ("i) Rolling-Referenz + MAD-Floor", test_rolling_reference_and_mad_floor),
+        ("j) Gold-Warmstart: GRUEN statt Richtung/AUS", test_gold_warmstart_green),
     ]
 
     failures = 0

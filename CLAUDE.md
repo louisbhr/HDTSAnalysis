@@ -61,6 +61,7 @@ Die Namen `EARLY`/`LATE` sind firmwareseitig fix — Wording-Änderungen betreff
 | Rolling-Referenz (12 Kontakte, ab 6) | ersetzt den Gold-Fallback im Halten |
 | MAD-Floor `max(MAD, 0.30 × GoldStd)` | kappt z-Explosion aus engen Teilmengen |
 | Kein Gold-Fallback im Aufbau | unter 15 Aufbau-Sprüngen nur das diffI-Kriterium |
+| **Gold-Warmstart zeigt GRÜN** | keine Richtung und kein AUS, solange gegen Gold gescort wird (beide Phasen) |
 
 Werte stehen in `importance_utils.py` — **dort ist die Wahrheit**, nicht hier.
 
@@ -134,11 +135,26 @@ Sobald das 12er-Fenster mischt, ist die Referenz eine Mittelung über fremde Kö
 steigt, `trend` verschiebt sich systematisch. Bei jeder Offline-Auswertung sicherstellen, dass
 pro Serie neu begonnen wird.
 
-**80 % „aus" im Aufbau ist kein Bug.** Ohne individuelle Aufbau-Baseline
-(`aufbau_reference_ok = False`) sieht `decide_feedback` per Design nur das diffI-Kriterium:
-GRÜN bei `diffI > 22`, sonst AUS — Richtungslichter erst, wenn die Aufbau-Baseline steht. Ein
-Wert von „Richtung 0 %" in einem Report beweist, dass ohne individuelle Aufbau-Baseline
-gelaufen wurde.
+**Der Gold-Warmstart erzeugte exakt MIN_ROLL Gelb-Sprünge — belegt, behoben.**
+Bei der Auswertung der Athletendateien (10.08.) hatten **5 von 7** Dateien im Halten exakt
+**6 GELB** — die Zahl ist `MIN_ROLL`. Es sind genau die Kontakte vor dem Füllen des
+Rolling-Fensters, gescort gegen den Goldstandard. Bei `jannick` und `jonas` war
+`trend_median` **bitgenau gleich** `abs_median` (Konsistenz = 1) — die Signatur aus §5.1.3.
+Zieht man diese 6 Kontakte ab: **83 % grün / 1 % gelb / 14 % blau** gegen den Zielwert
+88 / 1 / 10 aus §5.4. Die Logik war also korrekt, der Warmstart war das Problem.
+
+**Konsequenz (umgesetzt):** `_reference_for` liefert `is_own`; solange gegen Gold gescort
+wird, gibt `decide_feedback` **GRÜN** statt Richtung und statt AUS. Eine eigene Referenz ist
+entweder das gefüllte Rolling-Fenster **oder** eine individuelle gespeicherte Baseline.
+
+**Deshalb in der App immer das Athletenprofil wählen.** Mit individueller Baseline ist
+`is_own` ab dem ersten Kontakt wahr, es gibt gar keinen Gold-Warmstart und die Richtung steht
+sofort zur Verfügung. Ohne Profil (`global`) sind die ersten 6 Kontakte je Phase grün.
+
+**Nebenwirkung im Blick behalten: Dauergrün bei kurzen Serien.** Bei ~18 Sprüngen und
+12 Halten-Kontakten sind 6 davon Warmstart — der Validierungssatz kommt pro Serie auf
+97–100 % grün. Das Übergabedokument warnt ausdrücklich vor „weder Dauergrün noch Dauerrot".
+Bei kurzen Einheiten ohne Athletenprofil trägt die Ampel wenig Information.
 
 **Das Aufbau-Paradox** (§3.2) ist der Grund für die gesamte Zwei-Phasen-Architektur: der
 Kontakt, der Höhe erzeugt, ist der lange, weiche „Lade-Kontakt", der vom Profi-Muster
@@ -178,13 +194,25 @@ ampel_firmware/       ESP32 (PlatformIO) — wird nicht geändert
 ## Verifikation
 
 ```bash
-python tools/test_refactor.py                      # 9 Tests (a–i), müssen alle grün sein
-python tools/simulate_feedback.py <pfad|ordner> [--profile NAME] [--live-check]
+python tools/test_refactor.py                      # 10 Tests (a–j), müssen alle grün sein
+python tools/simulate_feedback.py <pfad|ordner> [--profile NAME] [--group-by SPALTE] [--live-check]
 ```
 
-Die Testdatei muss die Fassung mit **a–i** sein. Eine ältere Fassung mit nur a–f ist im Umlauf;
-ihr fehlen genau die Tests für diffI-Totband, Hysterese-Phase und Rolling-Referenz/MAD-Floor —
-also für die zuletzt gebauten Teile. Bei nur 6 Tests: veraltete Datei, nicht weiterverwenden.
+Die Testdatei muss die Fassung mit **a–j** sein. Eine ältere Fassung mit nur a–f ist im Umlauf;
+ihr fehlen genau die Tests für diffI-Totband, Hysterese-Phase, Rolling-Referenz/MAD-Floor und
+Gold-Warmstart — also für die zuletzt gebauten Teile. Bei 6 Tests: veraltete Datei.
+
+**Verifiziert am Validierungssatz (10.08.):** `data/hdts_knie_gesamt.xlsx` ergibt
+**43 Aufbau / 96 Halten** — exakt die Phasenaufteilung aus §5.4. Ohne Gruppierung
+(`--group-by none`, eine Referenz über alle Serien, wie in der Referenzsimulation):
+trend Median **+0.04** bei 47 % negativ, gelb 10 % zu blau 9 % — nahe an §5.4 (−0.04 / 58 %)
+und praktisch symmetrisch.
+
+`--group-by` startet die Referenz je Athlet/Serie neu (Default `auto`: nimmt `Athlet` bzw.
+`Serie`, falls die Spalte existiert). Der Loader erkennt zweizeilige Kopfzeilen und entfernt
+Einheiten-Suffixe (`Peak_t [s]` → `Peak_t`). Liegen `X.csv` **und** `X_all.csv` nebeneinander,
+wird `X.csv` übersprungen: das ist die auf `HG > 0.1` gefilterte Baseline-Teilmenge, also reine
+Lade-Kontakte — sie doppelt zu zählen hat am 10.08. den Gesamtschnitt verfälscht.
 
 `simulate_feedback.py` treibt die **echten Produktionspfade** offline an (kein Nachbau):
 Phasenerkennung + Rolling-Referenz aus `JumpAnalyzer`, `compute_jump_score`, `decide_feedback`.
