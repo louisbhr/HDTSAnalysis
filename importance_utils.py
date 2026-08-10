@@ -46,8 +46,44 @@ DEADBAND_TREND = 0.5
 CONSISTENCY_GATE = 0.6
 
 # Phasengrenze: h_rel = h_previous / h_max. Ab hier gilt der Sprung als Phase
-# "halten" (nahe Bestleistung), sonst "aufbau".
+# "halten" (nahe Bestleistung), sonst "aufbau". NUR noch fuer den Offline-Profiler
+# und Rueckwaertskompatibilitaet - die Live-Phase kommt aus der HG-Dynamik (s.u.).
 PHASE_HALTEN_H_REL = 0.9
+
+# --- diffI-Totband (Phase "aufbau") ---------------------------------------
+# diffI = Integral(i) - Integral(i-1) ist am Kontaktende latenzfrei verfuegbar und
+# praediziert den erst beim naechsten Kontakt messbaren Hoehengewinn HG. GRUEN im
+# Aufbau erst ab diffI > DIFFI_DEADBAND (kalibriert: robuste SD von diffI bei
+# stabilen Spruengen ~21.8, Median ~ -4.8) - verhindert Muenzwurf-Verhalten bei
+# stabilem Springen. EINE Wahrheit fuer jump_analyzer UND esp_client.
+DIFFI_DEADBAND = 22.0
+
+# --- Live-Phasenerkennung aus der HG-Dynamik (mit Hysterese) --------------
+# Einstieg "aufbau", wenn der letzte HG gross war ODER das Mittel der letzten drei
+# HG deutlich positiv ist; Ausstieg erst nach mehreren "ruhigen" Spruengen
+# (asymmetrische Hysterese -> kein Flattern, funktioniert auf jeder Hoehe).
+HG_AUFBAU_ENTRY = 0.15    # Sofort-Einstieg Aufbau, wenn HG[i-1] > diesem Wert
+HG_AUFBAU_MEAN3 = 0.08    # oder Mittel der letzten 3 HG darueber
+HYSTERESE_EXIT = 2        # so viele ruhige Spruenge, bis zurueck auf "halten"
+
+# --- Rolling-Referenz + MAD-Floor -----------------------------------------
+# Referenz aus den letzten ROLL_N phasengleichen Kontakten der laufenden Session
+# (ab MIN_ROLL Kontakten; davor Warmstart aus der gespeicherten Baseline). Loest
+# den Gold-Fallback-Schiefstand im Halten und ist tagesformrobust.
+ROLL_N = 12
+MIN_ROLL = 6
+# MAD-Floor: deviation = max(MAD, MAD_FLOOR_FACTOR * GoldStd). Kappt die z-Explosion
+# aus kleinen, homogenen Teilmengen (individuelle MADs koennen absurd eng werden).
+MAD_FLOOR_FACTOR = 0.30
+
+
+def stepword(level):
+    """Verbale Stufe aus dem Ampel-Level (1..3): 1 etwas, 2 deutlich, 3 sehr deutlich."""
+    if level >= 3:
+        return "sehr deutlich"
+    if level >= 2:
+        return "deutlich"
+    return "etwas"
 
 
 def determine_phase(h_previous, h_max, h_rel_threshold=PHASE_HALTEN_H_REL):

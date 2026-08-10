@@ -1,24 +1,22 @@
 import os
+from collections import deque
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, lfilter, lfilter_zi, find_peaks
 from scipy.integrate import trapezoid
 
 from importance_utils import (
-    normalize_importance, compute_jump_score, step_label,
-    DEADBAND_TREND, CONSISTENCY_GATE, determine_phase,
+    normalize_importance, compute_jump_score, MAD_CONSISTENCY,
+    ROLL_N, MIN_ROLL, MAD_FLOOR_FACTOR,
+    HG_AUFBAU_ENTRY, HG_AUFBAU_MEAN3, HYSTERESE_EXIT,
 )
 
-# Ampel-Zuordnung (ESP32): optional - der Analyzer laeuft auch ohne esp_client.
+# Feedback-Entscheidung (LED + Text in EINER Funktion) aus esp_client. Optional -
+# der Analyzer laeuft auch ohne esp_client (dann ohne Richtungsansage).
 try:
-    from esp_client import classify_ampel
+    from esp_client import decide_feedback
 except Exception:
-    classify_ampel = None
-
-# Schwelle fuer die Output-orientierte Ampel in Phase "aufbau": diffI (= Integral(i)
-# - Integral(i-1)) ist am Kontaktende latenzfrei verfuegbar und praediziert den erst
-# beim naechsten Kontakt messbaren Hoehengewinn HG.
-AUFBAU_DIFFI_THRESHOLD = 0.0
+    decide_feedback = None
 
 
 class JumpAnalyzer:
@@ -92,6 +90,18 @@ class JumpAnalyzer:
         # Integral des zuletzt verarbeiteten Kontakts, fuer diffI = Integral(i) - Integral(i-1).
         self.last_integral = None
 
+        # --- Live-Phasenerkennung aus HG-Dynamik (mit Hysterese) ---
+        # HG[i] = h_previous[i] - h_previous[i-1] (Hoehengewinn ueber Kontakt i-1).
+        self._phase = "aufbau"        # Startphase konservativ (keine Timing-Bewertung)
+        self._quiet_count = 0         # aufeinanderfolgende "ruhige" Spruenge (fuer Ausstieg)
+        self._last_h_previous = None  # Einflug-Hoehe des vorigen Kontakts
+        self._hg_series = []          # abgeschlossene HG-Werte in Reihenfolge
+
+        # --- Rolling-Referenz je Phase (letzte ROLL_N phasengleichen Kontakte) ---
+        self._roll = {"aufbau": deque(maxlen=ROLL_N), "halten": deque(maxlen=ROLL_N)}
+        # GoldStd je Feature fuer den MAD-Floor (wird in load_profile gefuellt).
+        self._gold_std = {}
+
         # Korrekturrichtung je Feature (+1: hoeher ist besser, -1: niedriger ist besser).
         self.direction_multiplier = {
             "Peak_t": 1, "Peak_Prct": 1,
@@ -136,6 +146,84 @@ class JumpAnalyzer:
             importances = {var: 1.0 for var in self.var_names}
             mode = self._build_mode_dict(medians, mads, importances)
             return mode, 4.5
+
+    def _load_gold_std(self):
+        """Liest GoldStd je Feature (fuer den MAD-Floor). Bei Fehler leeres dict."""
+        try:
+            gold = pd.read_excel("goldTableNeu.xlsx").set_index("Feature").reindex(self.var_names)
+            return {var: float(gold.loc[var, "GoldStd"]) for var in self.var_names
+                    if np.isfinite(gold.loc[var, "GoldStd"])}
+        except Exception:
+            return {}
+
+    # ---- 1c. MAD-Floor + Referenzaufbau (Rolling ODER Warmstart) ----
+    def _apply_mad_floor(self, deviation):
+        """deviation = max(MAD, MAD_FLOOR_FACTOR * GoldStd) je Feature.
+
+        Kappt die z-Explosion aus kleinen, homogenen Teilmengen (individuelle MADs
+        koennen absurd eng werden, z.B. Peak_t-MAD ~ Messaufloesung)."""
+        out = {}
+        for f, d in deviation.items():
+            gstd = self._gold_std.get(f)
+            if gstd is not None and np.isfinite(gstd) and gstd > 0:
+                out[f] = max(float(d), MAD_FLOOR_FACTOR * float(gstd))
+            else:
+                out[f] = float(d)
+        return out
+
+    def _reference_for(self, phase):
+        """Baut die Score-Referenz fuer die aktuelle Phase.
+
+        Ab MIN_ROLL phasengleichen Kontakten im rollierenden Fenster: Median/MAD aus
+        dem Fenster (tagesformrobust, loest den Gold-Fallback-Schiefstand). Davor
+        Warmstart aus der gespeicherten Baseline. Importance stammt in beiden Faellen
+        aus der gespeicherten Baseline. MAD-Floor wird immer angewandt.
+        """
+        stored = self.profiles.get(phase) or self.profiles.get("halten")
+        window = self._roll.get(phase)
+        if window is not None and len(window) >= MIN_ROLL:
+            ref, dev = {}, {}
+            for f in self.var_names:
+                vals = np.array([row[f] for row in window
+                                 if f in row and np.isfinite(row[f])], dtype=float)
+                if len(vals) > 0:
+                    med = float(np.median(vals))
+                    mad = float(np.median(np.abs(vals - med))) * MAD_CONSISTENCY
+                    ref[f] = med
+                    dev[f] = mad if mad > 0 else 1e-6
+                else:
+                    ref[f], dev[f] = 0.0, 1.0
+            return {"reference": ref,
+                    "deviation": self._apply_mad_floor(dev),
+                    "importance_dict": stored["importance_dict"]}
+        # Warmstart: gespeicherte Baseline, aber mit MAD-Floor.
+        return {"reference": stored["reference"],
+                "deviation": self._apply_mad_floor(dict(stored["deviation"])),
+                "importance_dict": stored["importance_dict"]}
+
+    # ---- 1d. Live-Phase aus der HG-Dynamik (asymmetrische Hysterese) ----
+    def _update_phase_from_hg(self):
+        """Aktualisiert self._phase anhand der bisher abgeschlossenen HG-Werte.
+
+        Einstieg "aufbau": letzter HG > HG_AUFBAU_ENTRY ODER Mittel der letzten 3 HG
+        > HG_AUFBAU_MEAN3. Ausstieg "halten" erst nach HYSTERESE_EXIT ruhigen
+        Spruengen -> kein Flattern, unabhaengig von der absoluten Hoehe.
+        """
+        hg = self._hg_series
+        entry = False
+        if hg:
+            last_hg = hg[-1]
+            mean3 = float(np.mean(hg[-3:]))
+            entry = (last_hg > HG_AUFBAU_ENTRY) or (mean3 > HG_AUFBAU_MEAN3)
+        if entry:
+            self._phase = "aufbau"
+            self._quiet_count = 0
+        elif self._phase == "aufbau":
+            self._quiet_count += 1
+            if self._quiet_count >= HYSTERESE_EXIT:
+                self._phase = "halten"
+                self._quiet_count = 0
+        return self._phase
 
     # ---- 2. Profil laden ----
     def load_profile(self, athlet_name, logFcn=print):
@@ -193,6 +281,8 @@ class JumpAnalyzer:
         self.profiles = profiles
         self.mode_sources = dict(mode_sources)
         self.h_max = h_max if h_max is not None else 4.5
+        # GoldStd je Feature fuer den MAD-Floor bereitstellen.
+        self._gold_std = self._load_gold_std()
 
         src_txt = {"individuelle Baseline": "individuell", "Goldstandard": "Standard"}
         a_src = src_txt.get(mode_sources.get("aufbau"), "Standard")
@@ -406,20 +496,25 @@ class JumpAnalyzer:
             self.data["Integral"].append(integral_full)
             self.data["diffI"].append(diffI)
 
-            # ~ 4.4 Phasen-Weiche + Coaching-Logik ~
+            # ~ 4.4 Phasen-Weiche (HG-Dynamik) + Referenz + Feedback ~
+            # Einflug-Hoehe VOR diesem Kontakt; daraus der ueber den VORIGEN Kontakt
+            # abgeschlossene Hoehengewinn HG (fuer die Phasenerkennung, latenzarm).
             h_previous = self._h_previous_for_jump(next_jump_idx, left)
-            phase = determine_phase(h_previous, self.h_max)
+            if h_previous is not None and np.isfinite(h_previous):
+                if self._last_h_previous is not None and np.isfinite(self._last_h_previous):
+                    self._hg_series.append(h_previous - self._last_h_previous)
+                self._last_h_previous = h_previous
+            phase = self._update_phase_from_hg()
+            phase_label = "Aufbau" if phase == "aufbau" else "Halten"
 
             current_features = {
                 "Peak_t": peak_t, "Peak_Prct": peak_prct, "Explosiv": explosiv,
                 "preSlope": pre_slope, "postSlope": post_slope, "Symmetry": sym,
             }
 
-            mode_profile = self.profiles.get(phase, self.profiles.get("halten"))
-
-            # ZENTRALE Score-Berechnung (Importance intern auf Summe = 1.0 normiert).
-            # Wird in BEIDEN Phasen berechnet und geloggt (fuer spaetere Analysen),
-            # auch wenn die Coaching-AUSGABE in "aufbau" nicht timing-basiert ist.
+            # Referenz: Rolling (letzte ROLL_N phasengleichen Kontakte) oder Warmstart
+            # aus der gespeicherten Baseline, jeweils mit MAD-Floor.
+            mode_profile = self._reference_for(phase)
             result = compute_jump_score(
                 current_features=current_features,
                 reference=mode_profile["reference"],
@@ -428,67 +523,48 @@ class JumpAnalyzer:
                 direction=self.direction_multiplier,
                 feature_order=self.var_names,
             )
-
             trend_score = result["trend_score"]   # mit Richtung (+ = "frueher treten")
             abs_score = result["abs_score"]        # reine Abweichung, gewichtetes Mittel der |z|
 
             self.total_jump_count += 1
 
-            # Klartext-Rueckmeldung je Phase (eine verstaendliche Zeile pro Sprung).
-            if phase == "halten":
-                phase_label = "Halten"
-                if abs(trend_score) < DEADBAND_TREND:
-                    coaching_output = "Timing stabil"
-                else:
-                    consistency = (abs(trend_score) / abs_score) if abs_score > 0.0 else 0.0
-                    if consistency > CONSISTENCY_GATE:
-                        direction_txt = "früher treten" if trend_score > 0 else "später treten"
-                        coaching_output = f"{step_label(abs_score)} {direction_txt}"
-                    else:
-                        coaching_output = "Abweichung uneinheitlich"
-            else:  # phase == "aufbau": keine Timing-Bewertung, output-orientierte Rueckmeldung.
-                phase_label = "Aufbau"
-                if not np.isfinite(diffI):
-                    coaching_output = "erster Sprung"
-                elif diffI > AUFBAU_DIFFI_THRESHOLD:
-                    coaching_output = "Höhe kommt"
-                else:
-                    coaching_output = "mehr Druck ins Tuch"
+            # EINE Entscheidung fuer Text UND LED (keine Divergenz mehr). Richtungslichter
+            # im Aufbau nur gegen eine INDIVIDUELLE Aufbau-Baseline (Gold waere falsch).
+            aufbau_ok = (self.mode_sources.get("aufbau") == "individuelle Baseline")
+            if decide_feedback is not None:
+                direction, level, coaching_output = decide_feedback(
+                    trend_score, abs_score, phase=phase, diffI=diffI,
+                    aufbau_reference_ok=aufbau_ok)
+            else:
+                direction, level, coaching_output = ("OFF", 0, "kein Signal")
+            self.last_ampel_state = (direction, level)
 
             # Eine Zeile pro Sprung: Nr. · Phase · Klartext (kompakte Kennzahl in Sigma).
             logFcn(f"Sprung {self.total_jump_count} · {phase_label} · {coaching_output} "
                    f"(Abweichung {abs_score:.1f}σ)")
-
             self.data["coaching"].append(coaching_output)
 
-            # ~ 4.5 Ampel (ESP32): Zustand aus derselben phasenabhaengigen Logik ~
-            if classify_ampel is not None:
-                # Richtungslichter im Aufbau nur gegen eine INDIVIDUELLE
-                # Aufbau-Baseline (Goldstandard = Steady-State waere dort falsch).
-                aufbau_ok = (self.mode_sources.get("aufbau") == "individuelle Baseline")
-                self.last_ampel_state = classify_ampel(
-                    trend_score, abs_score, phase=phase, diffI=diffI,
-                    aufbau_reference_ok=aufbau_ok)
-                if self.ampel_client is not None:
-                    led_direction, led_level = self.last_ampel_state
-                    try:
-                        self.ampel_client.send_state(led_direction, led_level)
-                    except Exception as e:
-                        logFcn(f"Ampel: Senden fehlgeschlagen ({e}).")
+            # LED setzen (identisch zum Text, da aus derselben Entscheidung).
+            if self.ampel_client is not None:
+                try:
+                    self.ampel_client.send_state(direction, level)
+                except Exception as e:
+                    logFcn(f"Ampel: Senden fehlgeschlagen ({e}).")
 
-            # ~ 4.6 Live-Dashboard (GUI): Schnellinfos zum aktuellen Sprung ~
-            # Laeuft immer (auch ohne Ampel-Client / ohne classify_ampel); Fehler
-            # im Callback duerfen die Analyse nie stoeren.
+            # Live-Dashboard (GUI): Schnellinfos; Fehler duerfen die Analyse nie stoeren.
             if self.on_jump is not None:
                 try:
                     self.on_jump({
                         "jump_no": self.total_jump_count,
                         "phase": phase,
-                        "ampel_direction": self.last_ampel_state[0],
-                        "ampel_level": self.last_ampel_state[1],
+                        "ampel_direction": direction,
+                        "ampel_level": level,
                     })
                 except Exception:
                     pass
+
+            # Aktuellen Kontakt NACH dem Scoren ins phasengleiche Rolling-Fenster legen.
+            self._roll[phase].append(current_features)
 
             self.last_analyzed_jump_idx = next_jump_idx
 
@@ -504,6 +580,12 @@ class JumpAnalyzer:
         self.last_analyzed_jump_idx = -1
         self.last_integral = None
         self.last_ampel_state = ("OFF", 0)
+        # Phasen- und Rolling-Referenz-Zustand fuer die neue Session zuruecksetzen.
+        self._phase = "aufbau"
+        self._quiet_count = 0
+        self._last_h_previous = None
+        self._hg_series = []
+        self._roll = {"aufbau": deque(maxlen=ROLL_N), "halten": deque(maxlen=ROLL_N)}
         self.zi = lfilter_zi(self.b, self.a)
         self.data = {var: [] for var in self.log_var_names}
         self.data["coaching"] = []

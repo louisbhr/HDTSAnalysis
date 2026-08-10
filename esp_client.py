@@ -50,7 +50,7 @@ except ImportError:
 # phasenabhaengigen Coaching-Ausgabe im JumpAnalyzer passt.
 from importance_utils import (
     STEP_THRESHOLD_MEDIUM, STEP_THRESHOLD_STRONG,
-    DEADBAND_TREND, CONSISTENCY_GATE,
+    DEADBAND_TREND, CONSISTENCY_GATE, DIFFI_DEADBAND, stepword,
 )
 
 # Falls "frueher"/"spaeter" auf der Hardware vertauscht wirkt, hier True setzen.
@@ -80,50 +80,48 @@ def _direction_state(trend_score, abs_score):
     return ("EARLY", level) if frueher else ("LATE", level)
 
 
-def classify_ampel(trend_score, abs_score, phase="halten", diffI=None,
-                   aufbau_reference_ok=True):
-    """Bildet einen Sprung auf einen Ampel-Zustand ab (phasenabhaengig).
+def _direction_text(direction, level):
+    """Deutscher Klartext zu einer Richtung (Wording: "frueher/spaeter treten")."""
+    if direction == "EARLY":
+        return f"{stepword(level)} früher treten"
+    return f"{stepword(level)} später treten"
 
-    Rueckgabe: (direction, level)
-        direction in {"GOOD", "EARLY", "LATE", "OFF"}, level 0..3
+
+def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
+                    aufbau_reference_ok=True):
+    """EINE Entscheidung fuer LED **und** Log-Text (behebt die fruehere Divergenz).
+
+    Rueckgabe: (direction, level, text)
+        direction in {"GOOD", "EARLY", "LATE", "OFF"}, level 0..3, text = deutsche
+        Klartext-Rueckmeldung, die exakt zur LED passt.
         (GELB = EARLY = "frueher treten", BLAU = LATE = "spaeter treten")
 
     Phase "halten" (Score gegen die Halten-Referenz):
-        |trend| < DEADBAND_TREND                     -> GOOD  (Timing stabil)
-        trend > +DEADBAND und Konsistenz-Gate ok     -> EARLY (frueher treten)
-        trend < -DEADBAND und Konsistenz-Gate ok     -> LATE  (spaeter treten)
-        Gate verletzt (|trend|/abs <= CONSISTENCY_GATE) -> OFF
+        |trend| < DEADBAND_TREND                      -> GOOD  ("Timing stabil")
+        trend > +DEADBAND und Konsistenz-Gate ok      -> EARLY (frueher treten)
+        trend < -DEADBAND und Konsistenz-Gate ok      -> LATE  (spaeter treten)
+        Gate verletzt (|trend|/abs <= CONSISTENCY_GATE) -> OFF ("uneinheitlich")
 
-    Phase "aufbau" (Score gegen die AUFBAU-Referenz - Kontakte, die Hoehe
-    erzeugt haben; gegen DIESE Referenz ist frueher/spaeter auch im Aufbau
-    ein sinnvoller Hinweis):
-        diffI > 0                                    -> GOOD  (Erfolg schlaegt
-                                                       Muster: Hoehe gewonnen ->
-                                                       immer gruen, auch bei
-                                                       Timing-Abweichung)
-        diffI <= 0 und trend < -DEADBAND             -> LATE  (spaeter/laenger)
-        diffI <= 0 und trend > +DEADBAND             -> EARLY (frueher)
-        diffI <= 0 und |trend| < DEADBAND            -> OFF
+    Phase "aufbau" (Score gegen die AUFBAU-Referenz):
+        diffI > DIFFI_DEADBAND                        -> GOOD  ("Hoehe kommt")
+        sonst, ohne Aufbau-Baseline                  -> OFF   ("kein Signal")
+        sonst, diffI = NaN (erster Sprung)           -> OFF   ("erster Sprung")
+        sonst, |trend| < DEADBAND                    -> OFF   ("mehr Druck ins Tuch")
+        sonst, trend > +DEADBAND                     -> EARLY (frueher treten)
+        sonst, trend < -DEADBAND                     -> LATE  (spaeter treten)
 
-    Fallback ohne individuelle Aufbau-Baseline (aufbau_reference_ok=False):
-    Der Goldstandard beschreibt Steady-State-Kontakte und waere als
-    Aufbau-Referenz genau falsch. Daher faehrt die Ampel dann NUR das
-    diffI-Kriterium (GOOD bei diffI > 0, sonst OFF) - Richtungslichter erst,
-    sobald die Aufbau-Baseline steht.
-
-    diffI = NaN (erster Sprung, kein Vorgaenger-Integral) -> OFF, da noch
-    keine Aussage ueber den Hoehengewinn moeglich ist.
-
-    Rueckwaertskompatibel: classify_ampel(trend, abs) ohne weitere Argumente
-    verhaelt sich wie die Halten-Logik.
+    Fallback ohne individuelle Aufbau-Baseline: Der Goldstandard beschreibt
+    Steady-State-Kontakte und waere als Aufbau-Referenz genau falsch. Daher NUR
+    das diffI-Kriterium (GOOD bei diffI > Totband, sonst OFF), Richtungslichter
+    erst wenn die Aufbau-Baseline steht.
     """
     try:
         abs_score = float(abs_score)
         trend_score = float(trend_score)
     except (TypeError, ValueError):
-        return ("OFF", 0)
+        return ("OFF", 0, "kein Signal")
     if not (math.isfinite(abs_score) and math.isfinite(trend_score)):
-        return ("OFF", 0)
+        return ("OFF", 0, "kein Signal")
 
     if str(phase).lower() == "aufbau":
         try:
@@ -131,23 +129,35 @@ def classify_ampel(trend_score, abs_score, phase="halten", diffI=None,
         except (TypeError, ValueError):
             diffI_val = float("nan")
 
-        if math.isfinite(diffI_val) and diffI_val > 0:
-            return ("GOOD", 0)
+        if math.isfinite(diffI_val) and diffI_val > DIFFI_DEADBAND:
+            return ("GOOD", 0, "Höhe kommt")
         if not aufbau_reference_ok:
-            return ("OFF", 0)
+            return ("OFF", 0, "kein Signal")
         if not math.isfinite(diffI_val):
-            return ("OFF", 0)
+            return ("OFF", 0, "erster Sprung")
         if abs(trend_score) < DEADBAND_TREND:
-            return ("OFF", 0)
-        return _direction_state(trend_score, abs_score)
+            return ("OFF", 0, "mehr Druck ins Tuch")
+        direction, level = _direction_state(trend_score, abs_score)
+        return (direction, level, _direction_text(direction, level))
 
     # Phase "halten"
     if abs(trend_score) < DEADBAND_TREND:
-        return ("GOOD", 0)
+        return ("GOOD", 0, "Timing stabil")
     consistency = (abs(trend_score) / abs_score) if abs_score > 0 else 0.0
     if consistency <= CONSISTENCY_GATE:
-        return ("OFF", 0)
-    return _direction_state(trend_score, abs_score)
+        return ("OFF", 0, "Abweichung uneinheitlich")
+    direction, level = _direction_state(trend_score, abs_score)
+    return (direction, level, _direction_text(direction, level))
+
+
+def classify_ampel(trend_score, abs_score, phase="halten", diffI=None,
+                   aufbau_reference_ok=True):
+    """Duenner Wrapper um decide_feedback fuer Aufrufer, die nur (direction, level)
+    brauchen. EINZIGE Entscheidungslogik lebt in decide_feedback."""
+    direction, level, _text = decide_feedback(
+        trend_score, abs_score, phase=phase, diffI=diffI,
+        aufbau_reference_ok=aufbau_reference_ok)
+    return (direction, level)
 
 
 class _ConnLost(Exception):
