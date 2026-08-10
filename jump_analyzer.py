@@ -9,6 +9,7 @@ from importance_utils import (
     normalize_importance, compute_jump_score, MAD_CONSISTENCY,
     ROLL_N, MIN_ROLL, MAD_FLOOR_FACTOR,
     HG_AUFBAU_ENTRY, HG_AUFBAU_MEAN3, HYSTERESE_EXIT,
+    DEADBAND_WINDOW, effective_deadband,
 )
 
 # Feedback-Entscheidung (LED + Text in EINER Funktion) aus esp_client. Optional -
@@ -101,6 +102,15 @@ class JumpAnalyzer:
         self._roll = {"aufbau": deque(maxlen=ROLL_N), "halten": deque(maxlen=ROLL_N)}
         # GoldStd je Feature fuer den MAD-Floor (wird in load_profile gefuellt).
         self._gold_std = {}
+
+        # --- Quantil-Totband je Phase (Uebergabe 7.1) ---------------------
+        # trend-Werte der letzten Kontakte, aus denen das wirksame Totband als
+        # Quantil gebildet wird. NUR Kontakte, die gegen die EIGENE Referenz
+        # gescort wurden - Gold-Werte liegen konstant bei +1.2..+2.6 Sigma und
+        # wuerden das Quantil aufblasen. Je Phase getrennt, weil Aufbau- und
+        # Halten-Kontakte voellig verschiedene trend-Verteilungen haben.
+        self._trend_hist = {"aufbau": deque(maxlen=DEADBAND_WINDOW),
+                            "halten": deque(maxlen=DEADBAND_WINDOW)}
 
         # Korrekturrichtung je Feature (+1: hoeher ist besser, -1: niedriger ist besser).
         self.direction_multiplier = {
@@ -543,11 +553,16 @@ class JumpAnalyzer:
             # fuer beide Phasen und ersetzt die frueher nur an der gespeicherten
             # Aufbau-Baseline haengende Sperre.
             ref_is_own = bool(mode_profile.get("is_own", True))
+            # Totband aus der eigenen juengsten trend-Verteilung dieser Phase
+            # (Uebergabe 7.1). Vor DEADBAND_MIN_N eigenen Werten liefert
+            # effective_deadband den Fixwert - kein Sonderfall noetig.
+            band = effective_deadband(self._trend_hist[phase])
             if decide_feedback is not None:
                 direction, level, coaching_output = decide_feedback(
                     trend_score, abs_score, phase=phase, diffI=diffI,
                     aufbau_reference_ok=ref_is_own,
-                    reference_is_own=ref_is_own)
+                    reference_is_own=ref_is_own,
+                    deadband=band)
             else:
                 direction, level, coaching_output = ("OFF", 0, "kein Signal")
             self.last_ampel_state = (direction, level)
@@ -579,6 +594,12 @@ class JumpAnalyzer:
             # Aktuellen Kontakt NACH dem Scoren ins phasengleiche Rolling-Fenster legen.
             self._roll[phase].append(current_features)
 
+            # trend NUR dann ins Totband-Fenster, wenn gegen die EIGENE Referenz
+            # gescort wurde. Gold-Warmstart-Werte (+1.2..+2.6 Sigma) wuerden das
+            # Quantil aufblasen und die Ampel danach stumm schalten.
+            if ref_is_own and np.isfinite(trend_score):
+                self._trend_hist[phase].append(float(trend_score))
+
             self.last_analyzed_jump_idx = next_jump_idx
 
     def reset(self):
@@ -599,6 +620,8 @@ class JumpAnalyzer:
         self._last_h_previous = None
         self._hg_series = []
         self._roll = {"aufbau": deque(maxlen=ROLL_N), "halten": deque(maxlen=ROLL_N)}
+        self._trend_hist = {"aufbau": deque(maxlen=DEADBAND_WINDOW),
+                            "halten": deque(maxlen=DEADBAND_WINDOW)}
         self.zi = lfilter_zi(self.b, self.a)
         self.data = {var: [] for var in self.log_var_names}
         self.data["coaching"] = []

@@ -16,6 +16,8 @@ Dadurch wird der Score zu einem gewichteten Mittel der absoluten Abweichungen
     => abs_score ~ "durchschnittliche Abweichung in Standardabweichungen".
 """
 
+import math
+
 import numpy as np
 
 # Zielsumme aller Importances. Bewusst zentral als Konstante, damit es nur EINE Wahrheit gibt.
@@ -36,9 +38,31 @@ STEP_THRESHOLD_MEDIUM = 1.4   # darueber: "deutlich"
 # beiden Referenz-Modi leben sonst auf verschiedenen Skalen.
 MAD_CONSISTENCY = 1.4826
 
-# Totband fuer den Trend-Score in Phase "halten": innerhalb dieser Bandbreite gilt
-# das Timing als stabil, es wird keine Richtung ausgegeben.
+# Totband fuer den Trend-Score: innerhalb dieser Bandbreite gilt das Timing als
+# stabil, es wird keine Richtung ausgegeben. Fixwert = Rueckfallebene und Warmstart,
+# solange zu wenig eigene trend-Werte fuer das Quantil vorliegen (s.u.).
 DEADBAND_TREND = 0.5
+
+# --- Quantil-Totband (Uebergabe 7.1) --------------------------------------
+# Ein FESTER Wert 0.5 wirkt je Athlet voellig verschieden: Feedback-Rate 33 % beim
+# Live-Test (1 Erwachsener), aber nur 12 % auf der Validierungsgruppe. Die
+# Kalibrierkurve dort: 0.25 -> 34 %, 0.30 -> 30 %, 0.40 -> 20 %, 0.50 -> 12 %.
+# Ein festes Totband kalibriert also immer nur EINEN Koerper richtig.
+#
+# Loesung: Totband = Quantil der EIGENEN juengsten |trend|-Werte. Bei P70 liegen
+# per Konstruktion ~30 % der Kontakte darueber -> die Feedback-Rate ist nicht mehr
+# vom Athleten abhaengig, sondern eingestellt. Das Kind wird gegen sein eigenes
+# gestriges Streuungsmass bewertet, nicht gegen eine fremde Zahl.
+DEADBAND_MODE = "quantil"     # "quantil" | "fix" - Rueckfall auf DEADBAND_TREND
+DEADBAND_QUANTILE = 0.70      # P70 -> Ziel-Feedback-Rate ~30 %
+DEADBAND_WINDOW = 20          # Uebergabe 7.1 nennt 12-20; 20 gibt ein ruhigeres Quantil
+DEADBAND_MIN_N = 8            # darunter ist ein P70 Rauschen -> Fixwert
+# Leitplanken. NICHT aus den Daten abgeleitet, sondern bewusst gesetzt: ein Quantil
+# kann bei sehr gleichfoermigem Springen gegen 0 kollabieren (dann wuerde jedes
+# Zittern zur Richtungsansage) oder bei chaotischem Springen weglaufen (dann waere
+# die Ampel stumm). Untergrenze = bester Punkt der Kalibrierkurve oben.
+DEADBAND_FLOOR = 0.25
+DEADBAND_CEIL = 1.20
 
 # Konsistenz-Gate in Phase "halten": eine Richtung wird nur ausgegeben, wenn der
 # Trend-Score einen ausreichend grossen Anteil des Absolut-Scores erklaert
@@ -75,6 +99,56 @@ MIN_ROLL = 6
 # MAD-Floor: deviation = max(MAD, MAD_FLOOR_FACTOR * GoldStd). Kappt die z-Explosion
 # aus kleinen, homogenen Teilmengen (individuelle MADs koennen absurd eng werden).
 MAD_FLOOR_FACTOR = 0.30
+
+
+def effective_deadband(trend_history):
+    """Wirksames Trend-Totband aus der eigenen juengsten |trend|-Verteilung.
+
+    trend_history: iterierbar mit den trend-Werten der letzten phasengleichen
+    Kontakte, die gegen die EIGENE Referenz gescort wurden. Vorzeichen egal, es
+    wird mit Betraegen gerechnet.
+
+    Rueckgabe: Totband als float.
+
+    WICHTIG - nur eigene Werte einspeisen. Gegen den Goldstandard liegt trend
+    konstant bei +1.2 bis +2.6 Sigma (Uebergabe 5.1.3); solche Werte im Fenster
+    wuerden das Quantil massiv aufblasen und die Ampel danach stumm schalten.
+    Die Auswahl passiert beim Befuellen (jump_analyzer), nicht hier.
+
+    Unter DEADBAND_MIN_N Werten oder bei DEADBAND_MODE != "quantil" gilt der
+    Fixwert DEADBAND_TREND. Das Ergebnis wird auf [DEADBAND_FLOOR, DEADBAND_CEIL]
+    begrenzt.
+    """
+    if DEADBAND_MODE != "quantil":
+        return DEADBAND_TREND
+
+    values = []
+    for t in (trend_history or ()):
+        try:
+            t = float(t)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(t):
+            values.append(abs(t))
+
+    if len(values) < DEADBAND_MIN_N:
+        return DEADBAND_TREND
+
+    # Nur die juengsten DEADBAND_WINDOW Werte - Tagesform statt Sessiongedaechtnis.
+    values = values[-DEADBAND_WINDOW:]
+    values.sort()
+
+    # Lineare Interpolation zwischen den Rangplaetzen (wie numpy's Default), damit
+    # das Quantil bei kleinen n nicht auf einen einzelnen Wert einrastet.
+    pos = DEADBAND_QUANTILE * (len(values) - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    if lo == hi:
+        q = values[lo]
+    else:
+        q = values[lo] + (values[hi] - values[lo]) * (pos - lo)
+
+    return max(DEADBAND_FLOOR, min(DEADBAND_CEIL, q))
 
 
 def stepword(level):

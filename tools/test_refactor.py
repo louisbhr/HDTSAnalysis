@@ -323,6 +323,63 @@ def test_gold_warmstart_green():
           "eigene Referenz schaltet die Richtung frei.")
 
 
+def test_quantile_deadband():
+    """(k) Quantil-Totband (Uebergabe 7.1).
+
+    Ein fixes Totband 0.5 ergibt je Athlet voellig verschiedene Feedback-Raten
+    (33 % Live-Test vs. 12 % Validierungsgruppe). Das Quantil-Totband bindet die
+    Rate an die eigene Streuung statt an eine fremde Zahl.
+    """
+    from importance_utils import (effective_deadband, DEADBAND_TREND,
+                                  DEADBAND_MIN_N, DEADBAND_WINDOW,
+                                  DEADBAND_FLOOR, DEADBAND_CEIL,
+                                  DEADBAND_QUANTILE)
+    from esp_client import decide_feedback
+
+    # Zu wenig eigene Werte -> Fixwert (kein halbgares Quantil aus 3 Zahlen).
+    assert effective_deadband([]) == DEADBAND_TREND
+    assert effective_deadband([0.4] * (DEADBAND_MIN_N - 1)) == DEADBAND_TREND
+
+    # Ab DEADBAND_MIN_N greift das Quantil. Bei 0..1 gleichverteilt liegt P70 ~0.7.
+    vals = [i / 10.0 for i in range(11)]          # 0.0 .. 1.0
+    band = effective_deadband(vals)
+    assert abs(band - 0.7) < 0.05, band
+
+    # Vorzeichen egal - gerechnet wird mit Betraegen.
+    assert abs(effective_deadband([-v for v in vals]) - band) < 1e-9
+
+    # Zielrate: bei P70 liegen ~30 % der eigenen Werte ueber dem Totband.
+    ueber = sum(1 for v in vals if abs(v) > band) / len(vals)
+    assert 0.15 <= ueber <= 0.45, ueber
+
+    # Leitplanken greifen in beide Richtungen.
+    assert effective_deadband([0.001] * 20) == DEADBAND_FLOOR, "sehr gleichfoermig -> Floor"
+    assert effective_deadband([9.0] * 20) == DEADBAND_CEIL, "chaotisch -> Ceil"
+
+    # Nur die juengsten DEADBAND_WINDOW Werte zaehlen (Tagesform, kein Gedaechtnis).
+    alt_gross = [9.0] * 50 + [0.2] * DEADBAND_WINDOW
+    assert effective_deadband(alt_gross) == DEADBAND_FLOOR, "altes Fenster darf nicht nachwirken"
+
+    # Wirkung in decide_feedback: derselbe trend, zwei Totbaender -> zwei Ampeln.
+    assert decide_feedback(0.6, 0.8, phase="halten", deadband=0.30)[0] == "EARLY"
+    assert decide_feedback(0.6, 0.8, phase="halten", deadband=1.00)[0] == "GOOD"
+    # Ohne Angabe bleibt es beim Fixwert (Rueckwaertskompatibilitaet).
+    assert decide_feedback(0.6, 0.8, phase="halten")[0] == "EARLY"
+    assert decide_feedback(0.4, 0.8, phase="halten")[0] == "GOOD"
+
+    # Analyzer: Gold-gescorte Kontakte duerfen NICHT ins Totband-Fenster.
+    var_names = ["Peak_t", "Peak_Prct", "Explosiv", "preSlope", "postSlope", "Symmetry"]
+    a = jump_analyzer_module.JumpAnalyzer()
+    assert set(a._trend_hist) == {"aufbau", "halten"}, "Totband-Fenster je Phase"
+    assert a._trend_hist["halten"].maxlen == DEADBAND_WINDOW
+    a._trend_hist["halten"].extend([0.3] * DEADBAND_MIN_N)
+    a.reset()
+    assert len(a._trend_hist["halten"]) == 0, "reset() muss das Totband-Fenster leeren"
+
+    print(f"  OK: P{int(DEADBAND_QUANTILE * 100)}-Totband ab {DEADBAND_MIN_N} eigenen Werten, "
+          f"Leitplanken {DEADBAND_FLOOR}/{DEADBAND_CEIL}, Fixwert als Rueckfall.")
+
+
 def test_aufbau_fallback_pipeline():
     """(f) Zu wenig Aufbau-Spruenge: keine Aufbau-Zeilen in der Baseline-CSV,
     Analyzer erkennt den fehlenden Modus als Goldstandard-Quelle."""
@@ -385,6 +442,7 @@ def main():
         ("h) HG-Phasenerkennung mit Hysterese", test_hysterese_phase),
         ("i) Rolling-Referenz + MAD-Floor", test_rolling_reference_and_mad_floor),
         ("j) Gold-Warmstart: GRUEN statt Richtung/AUS", test_gold_warmstart_green),
+        ("k) Quantil-Totband (7.1)", test_quantile_deadband),
     ]
 
     failures = 0

@@ -37,7 +37,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
 from importance_utils import (compute_jump_score, DEADBAND_TREND, DIFFI_DEADBAND,
-                              ROLL_N, MIN_ROLL)
+                              ROLL_N, MIN_ROLL, effective_deadband,
+                              DEADBAND_MODE, DEADBAND_QUANTILE, DEADBAND_WINDOW,
+                              DEADBAND_MIN_N)
 import jump_analyzer as jump_analyzer_module
 import profiler
 
@@ -211,13 +213,20 @@ def simulate(rows, profile="global"):
         # Wie im Live-Pfad: Richtung nur gegen die EIGENE Referenz (Rolling-Fenster
         # oder individuelle Baseline); gegen Gold zeigt die Ampel GRUEN.
         ref_is_own = bool(ref.get("is_own", True))
+        # Totband aus der eigenen juengsten trend-Verteilung (Uebergabe 7.1) -
+        # exakt wie im Live-Pfad, damit die Simulation nicht auseinanderlaeuft.
+        band = effective_deadband(a._trend_hist[phase])
         direction, level, text = decide_feedback(
             trend, absx, phase=phase, diffI=row.get("diffI", np.nan),
-            aufbau_reference_ok=ref_is_own, reference_is_own=ref_is_own)
+            aufbau_reference_ok=ref_is_own, reference_is_own=ref_is_own,
+            deadband=band)
 
         records.append({"phase": phase, "direction": direction, "level": level,
-                        "trend": trend, "abs": absx, "text": text})
+                        "trend": trend, "abs": absx, "text": text,
+                        "deadband": band})
         a._roll[phase].append(cf)
+        if ref_is_own and np.isfinite(trend):
+            a._trend_hist[phase].append(float(trend))
         prev_hg = row.get("HG", np.nan)
     return records
 
@@ -346,6 +355,12 @@ def main():
     print(f"Warmstart-Profil: {args.profile}   |   Gruppierung: {args.group_by or 'aus'}")
     print(f"Konstanten: DEADBAND_TREND={DEADBAND_TREND}  DIFFI_DEADBAND={DIFFI_DEADBAND}"
           f"  ROLL_N={ROLL_N}  MIN_ROLL={MIN_ROLL}")
+    if DEADBAND_MODE == "quantil":
+        print(f"Totband: quantilbasiert (P{int(DEADBAND_QUANTILE * 100)} der letzten "
+              f"{DEADBAND_WINDOW} eigenen trend-Werte, ab {DEADBAND_MIN_N} Werten; "
+              f"davor fix {DEADBAND_TREND})")
+    else:
+        print(f"Totband: fix {DEADBAND_TREND}")
     print(f"Ausgewertete Dateien ({len(files)}):")
     for f in files:
         print(f"    {os.path.relpath(f, REPO_ROOT)}")

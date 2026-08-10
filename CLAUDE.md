@@ -43,8 +43,8 @@ Rohsignal → JumpAnalyzer.process()  (48er-Blöcke, inkrementelle Kontakterkenn
 `Peak` und `timing` werden weiter berechnet und geloggt, aber **nicht** gescort (`timing` war
 exakt `100 × Peak_t` → perfekte Kollinearität).
 
-**Zentraler Vertrag:** `decide_feedback(trend, abs, phase, diffI, aufbau_reference_ok)`
-gibt `(direction, level, text)` zurück. Text und LED stammen zwingend aus demselben Aufruf.
+**Zentraler Vertrag:** `decide_feedback(trend, abs, phase, diffI, aufbau_reference_ok,
+reference_is_own, deadband)` gibt `(direction, level, text)` zurück. Text und LED stammen zwingend aus demselben Aufruf.
 `classify_ampel` ist nur noch ein dünner Wrapper für Rückwärtskompatibilität.
 Protokoll zur Firmware: `SHOW EARLY <1..3>` / `SHOW LATE <1..3>` / `SHOW GOOD` / `OFF`.
 Die Namen `EARLY`/`LATE` sind firmwareseitig fix — Wording-Änderungen betreffen nur die GUI.
@@ -62,8 +62,15 @@ Die Namen `EARLY`/`LATE` sind firmwareseitig fix — Wording-Änderungen betreff
 | MAD-Floor `max(MAD, 0.30 × GoldStd)` | kappt z-Explosion aus engen Teilmengen |
 | Kein Gold-Fallback im Aufbau | unter 15 Aufbau-Sprüngen nur das diffI-Kriterium |
 | **Gold-Warmstart zeigt GRÜN** | keine Richtung und kein AUS, solange gegen Gold gescort wird (beide Phasen) |
+| **§7.1 Quantil-Totband** | `DEADBAND_MODE = "quantil"`: P70 der letzten 20 **eigenen** trend-Werte je Phase, ab 8 Werten, Leitplanken 0.25/1.20 |
 
 Werte stehen in `importance_utils.py` — **dort ist die Wahrheit**, nicht hier.
+
+**Zum Quantil-Totband** (`effective_deadband`): Nur Kontakte, die gegen die **eigene** Referenz
+gescort wurden, kommen ins Fenster — Gold-Werte liegen konstant bei +1.2 bis +2.6 σ und würden
+das Quantil aufblasen. Je Phase getrennt. `decide_feedback` bleibt zustandslos und bekommt das
+Band als Parameter `deadband=`; ohne Angabe gilt weiter der Fixwert. Zurückschalten: einzig
+`DEADBAND_MODE = "fix"`.
 
 ## Entschieden, aber **noch nicht gebaut**
 
@@ -73,10 +80,6 @@ Werte stehen in `importance_utils.py` — **dort ist die Wahrheit**, nicht hier.
 
 ## Offen — nicht eigenmächtig entscheiden
 
-- **§7.1 Totband quantilbasiert** (wichtigster offener Punkt). Fixes `DEADBAND_TREND = 0.5`
-  wirkt je Athlet völlig verschieden: Feedback-Rate 33 % beim Live-Test, aber nur 12 % auf der
-  Validierungsgruppe. Kalibrierkurve dort: 0.25 → 34 %, 0.30 → 30 %, 0.40 → 20 %, 0.50 → 12 %.
-  Vorschlag im Dokument: P70 der letzten 12–20 eigenen trend-Werte.
 - **§7.2 Übergangssprünge** am Ende einer Aufbau-Episode (Phase hängt 2–3 Sprünge nach).
 - **§7.3 Kontrollierter Höhenabbau** — soll die Ampel beim absichtlichen Abbremsen stumm sein?
 - **§7.4 Wording.** ⚠️ Das Dokument argumentiert in §3.6/§5.3 ausdrücklich **gegen** „früher/
@@ -194,11 +197,11 @@ ampel_firmware/       ESP32 (PlatformIO) — wird nicht geändert
 ## Verifikation
 
 ```bash
-python tools/test_refactor.py                      # 10 Tests (a–j), müssen alle grün sein
+python tools/test_refactor.py                      # 11 Tests (a–k), müssen alle grün sein
 python tools/simulate_feedback.py <pfad|ordner> [--profile NAME] [--group-by SPALTE] [--live-check]
 ```
 
-Die Testdatei muss die Fassung mit **a–j** sein. Eine ältere Fassung mit nur a–f ist im Umlauf;
+Die Testdatei muss die Fassung mit **a–k** sein. Eine ältere Fassung mit nur a–f ist im Umlauf;
 ihr fehlen genau die Tests für diffI-Totband, Hysterese-Phase, Rolling-Referenz/MAD-Floor und
 Gold-Warmstart — also für die zuletzt gebauten Teile. Bei 6 Tests: veraltete Datei.
 
@@ -223,6 +226,29 @@ also sind 8 × `MIN_ROLL` = **48 der 96** strukturell Warmstart-Grün. Von den r
 gegen die eigene Rolling-Referenz laufen, sind nur 3 nicht grün — das ist das Totband aus §7.1
 (Kalibrierkurve dort: 0.50 → 12 % Feedback-Rate). Der Warmstart-Fix ist damit korrekt, aber er
 verschiebt das Problem: auf kurzen Serien ohne Athletenprofil trägt die Ampel kaum Information.
+
+**Das Quantil-Totband ist auf diesem Datensatz nicht messbar — das ist kein Mangel des Features,
+sondern des Datensatzes.** Pro Serie braucht es erst `MIN_ROLL` = 6 Warmstart-Kontakte und dann
+`DEADBAND_MIN_N` = 8 eigene, bis das Quantil greift: **14 Halten-Kontakte**. Nur `lydia` (19)
+kommt darüber, also erreicht das Quantil **5 von 96** Halten-Kontakten (5 %). Der gruppierte Lauf
+bewegt sich entsprechend nur von 3 % auf 4 % Richtungsanteil. **Diese Zahl nicht als Beleg gegen
+das Feature lesen.**
+
+Isoliert man die Mechanik auf einem durchgehenden Kontaktstrom (`--group-by none`, 105 Halten,
+Quantil ab Kontakt 14 aktiv — methodisch **kein** Validierungswert, nur ein A/B der Logik):
+
+| Totband | grün | gelb | blau | aus | Richtung | Band Median |
+|---|---|---|---|---|---|---|
+| fix 0.5 | 76 % | 10 % | 9 % | 5 % | 19 % | 0.50 |
+| P70 | 76 % | 14 % | 9 % | **1 %** | 23 % | 0.48 |
+
+Der Gewinn kommt **nicht** aus einem systematisch kleineren Band (Median 0.48 ≈ 0.50), sondern
+aus der Anpassung je Kontakt. Bemerkenswert: „aus" fällt von 5 % auf 1 % — genau der Zustand,
+den der Nutzer minimiert haben will, weil ein nicht leuchtendes Gerät wie ein defektes wirkt.
+
+**Der echte Test steht noch aus** und braucht eine Session **mit Athletenprofil**: dann entfallen
+die 6 Warmstart-Kontakte, das Quantil greift ab Kontakt 8, und bei Sessionlängen von 35–68
+Sprüngen (wie in `louis_all.csv`) deckt es den Großteil der Kontakte ab.
 
 `--group-by` startet die Referenz je Athlet/Serie neu (Default `auto`: nimmt `Athlet` bzw.
 `Serie`, falls die Spalte existiert). Der Loader erkennt zweizeilige Kopfzeilen und entfernt

@@ -88,7 +88,8 @@ def _direction_text(direction, level):
 
 
 def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
-                    aufbau_reference_ok=True, reference_is_own=True):
+                    aufbau_reference_ok=True, reference_is_own=True,
+                    deadband=None):
     """EINE Entscheidung fuer LED **und** Log-Text (behebt die fruehere Divergenz).
 
     Rueckgabe: (direction, level, text)
@@ -96,19 +97,25 @@ def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
         Klartext-Rueckmeldung, die exakt zur LED passt.
         (GELB = EARLY = "frueher treten", BLAU = LATE = "spaeter treten")
 
+    deadband: wirksames Trend-Totband. None -> Fixwert DEADBAND_TREND. Der
+    Aufrufer (jump_analyzer) reicht hier das Quantil-Totband aus der eigenen
+    juengsten trend-Verteilung durch (importance_utils.effective_deadband,
+    Uebergabe 7.1). Diese Funktion bleibt bewusst zustandslos - das Gedaechtnis
+    liegt beim Analyzer, wo auch Rolling-Fenster und Phase leben.
+
     Phase "halten" (Score gegen die Halten-Referenz):
-        |trend| < DEADBAND_TREND                      -> GOOD  ("Timing stabil")
-        trend > +DEADBAND und Konsistenz-Gate ok      -> EARLY (frueher treten)
-        trend < -DEADBAND und Konsistenz-Gate ok      -> LATE  (spaeter treten)
+        |trend| < deadband                            -> GOOD  ("Timing stabil")
+        trend > +deadband und Konsistenz-Gate ok      -> EARLY (frueher treten)
+        trend < -deadband und Konsistenz-Gate ok      -> LATE  (spaeter treten)
         Gate verletzt (|trend|/abs <= CONSISTENCY_GATE) -> OFF ("uneinheitlich")
 
     Phase "aufbau" (Score gegen die AUFBAU-Referenz):
         diffI > DIFFI_DEADBAND                        -> GOOD  ("Hoehe kommt")
         sonst, ohne Aufbau-Baseline                  -> OFF   ("kein Signal")
         sonst, diffI = NaN (erster Sprung)           -> OFF   ("erster Sprung")
-        sonst, |trend| < DEADBAND                    -> OFF   ("mehr Druck ins Tuch")
-        sonst, trend > +DEADBAND                     -> EARLY (frueher treten)
-        sonst, trend < -DEADBAND                     -> LATE  (spaeter treten)
+        sonst, |trend| < deadband                    -> OFF   ("mehr Druck ins Tuch")
+        sonst, trend > +deadband                     -> EARLY (frueher treten)
+        sonst, trend < -deadband                     -> LATE  (spaeter treten)
 
     Fallback ohne individuelle Aufbau-Baseline: Der Goldstandard beschreibt
     Steady-State-Kontakte und waere als Aufbau-Referenz genau falsch. Daher NUR
@@ -132,6 +139,13 @@ def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
         return ("OFF", 0, "kein Signal")
     if not (math.isfinite(abs_score) and math.isfinite(trend_score)):
         return ("OFF", 0, "kein Signal")
+
+    try:
+        band = float(deadband)
+    except (TypeError, ValueError):
+        band = DEADBAND_TREND
+    if not math.isfinite(band) or band <= 0:
+        band = DEADBAND_TREND
 
     # --- Gold-Warmstart: keine Richtung, aber sichtbar GRUEN (siehe Docstring) ---
     if not reference_is_own:
@@ -158,13 +172,13 @@ def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
             # Erster Kontakt: diffI braucht einen Vorgaenger. Kein Grund fuer AUS -
             # die Ampel soll ab der ersten Landung sichtbar sein.
             return ("GOOD", 0, "erster Sprung")
-        if abs(trend_score) < DEADBAND_TREND:
+        if abs(trend_score) < band:
             return ("OFF", 0, "mehr Druck ins Tuch")
         direction, level = _direction_state(trend_score, abs_score)
         return (direction, level, _direction_text(direction, level))
 
     # Phase "halten"
-    if abs(trend_score) < DEADBAND_TREND:
+    if abs(trend_score) < band:
         return ("GOOD", 0, "Timing stabil")
     consistency = (abs(trend_score) / abs_score) if abs_score > 0 else 0.0
     if consistency <= CONSISTENCY_GATE:
