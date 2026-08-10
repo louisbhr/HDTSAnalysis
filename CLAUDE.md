@@ -202,11 +202,27 @@ Die Testdatei muss die Fassung mit **a–j** sein. Eine ältere Fassung mit nur 
 ihr fehlen genau die Tests für diffI-Totband, Hysterese-Phase, Rolling-Referenz/MAD-Floor und
 Gold-Warmstart — also für die zuletzt gebauten Teile. Bei 6 Tests: veraltete Datei.
 
-**Verifiziert am Validierungssatz (10.08.):** `data/hdts_knie_gesamt.xlsx` ergibt
-**43 Aufbau / 96 Halten** — exakt die Phasenaufteilung aus §5.4. Ohne Gruppierung
-(`--group-by none`, eine Referenz über alle Serien, wie in der Referenzsimulation):
-trend Median **+0.04** bei 47 % negativ, gelb 10 % zu blau 9 % — nahe an §5.4 (−0.04 / 58 %)
-und praktisch symmetrisch.
+**Verifiziert am Validierungssatz (10.08., nach dem Warmstart-Fix).** `data/hdts_knie_gesamt.xlsx`,
+zwei Läufe — **die Zahlen stammen aus verschiedenen Läufen und dürfen nicht gemischt werden.**
+
+| | `--group-by auto` (pro Serie) | `--group-by none` (eine Referenz über alle) | Ziel §5.4 |
+|---|---|---|---|
+| Phasen | **43 / 96** | 34 / 105 | 43 / 96 |
+| Halten grün/gelb/blau/aus | **97 / 1 / 2 / 0** | 76 / 10 / 9 / 5 | 88 / 1 / 10 |
+| trend Median | **+1.46**, 22 % neg. | +0.04, 47 % neg. | −0.04, 58 % neg. |
+
+Nur der gruppierte Lauf ist methodisch zulässig (siehe „Fallstricke": Rolling-Referenz über
+Athletengrenzen hinweg verfälscht alles) — und **er trifft §5.4 nicht**: 97 % Dauergrün. Der
+ungruppierte Lauf liegt näher an §5.4, mittelt aber über fremde Körper; seine Nähe zum Zielwert
+ist ein Artefakt, kein Beleg. Eine frühere Fassung dieses Absatzes zitierte die Phasenaufteilung
+aus dem einen und die trend-Werte aus dem anderen Lauf — genau der Fehler, den dieses Dokument
+verhindern soll.
+
+**Ursache des Dauergrüns (Rechnung, kein Verdacht):** jede der 8 Serien hat ≥ 9 Halten-Kontakte,
+also sind 8 × `MIN_ROLL` = **48 der 96** strukturell Warmstart-Grün. Von den restlichen 48, die
+gegen die eigene Rolling-Referenz laufen, sind nur 3 nicht grün — das ist das Totband aus §7.1
+(Kalibrierkurve dort: 0.50 → 12 % Feedback-Rate). Der Warmstart-Fix ist damit korrekt, aber er
+verschiebt das Problem: auf kurzen Serien ohne Athletenprofil trägt die Ampel kaum Information.
 
 `--group-by` startet die Referenz je Athlet/Serie neu (Default `auto`: nimmt `Athlet` bzw.
 `Serie`, falls die Spalte existiert). Der Loader erkennt zweizeilige Kopfzeilen und entfernt
