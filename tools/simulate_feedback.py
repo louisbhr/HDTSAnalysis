@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import glob
+import fnmatch
 import argparse
 
 import numpy as np
@@ -359,6 +360,16 @@ def main():
     ap.add_argument("--live-check", action="store_true",
                     help="Fuer .npz zusaetzlich den echten Live-Pfad gegenpruefen")
     ap.add_argument("--csv", default=None, help="Kennzahlen zusaetzlich als CSV-Zeilen hierhin")
+    # Rekursion standardmaessig AUS: athleten_daten/ enthaelt die <name>_all.csv,
+    # athleten_daten/sessions/<name>/ die .npz DERSELBEN Spruenge. Rekursiv zaehlt
+    # ein Ordnerlauf jeden Sprung doppelt (belegt: 345 aus _all.csv + 362 aus .npz
+    # = 707 "Spruenge" bei rund 345 echten).
+    ap.add_argument("--recurse", action="store_true",
+                    help="Unterordner mitnehmen. Achtung: athleten_daten/sessions/ "
+                         "enthaelt dieselben Spruenge wie die _all.csv -> Doppelzaehlung")
+    ap.add_argument("--exclude", action="append", default=None, metavar="MUSTER",
+                    help="Dateinamen-Muster ausschliessen, mehrfach angebbar "
+                         "(z. B. --exclude 'test*' --exclude 'video_test*')")
     ap.add_argument("--group-by", default="auto",
                     help="Spalte, bei der die Referenz neu startet (Default: auto -> "
                          "Athlet/Serie, falls vorhanden; 'none' schaltet die Trennung ab)")
@@ -374,12 +385,25 @@ def main():
     os.chdir(REPO_ROOT)
 
     if os.path.isdir(args.path):
-        files = sorted(glob.glob(os.path.join(args.path, "**", "*.*"), recursive=True))
+        pattern = os.path.join(args.path, "**", "*.*") if args.recurse \
+            else os.path.join(args.path, "*.*")
+        files = sorted(glob.glob(pattern, recursive=args.recurse))
         files = [f for f in files if os.path.splitext(f)[1].lower() in (".csv", ".xlsx", ".npz")]
     else:
         files = [args.path]
     if not files:
         print("Keine passenden Dateien (.csv/.xlsx/.npz) gefunden.")
+        return 1
+
+    excluded = []
+    if args.exclude:
+        for pat in args.exclude:
+            hits = [f for f in files
+                    if fnmatch.fnmatch(os.path.basename(f).lower(), pat.lower())]
+            excluded.extend(hits)
+        files = [f for f in files if f not in excluded]
+    if not files:
+        print("Alle Dateien durch --exclude ausgeschlossen.")
         return 1
 
     # "<name>.csv" ist die auf HG > HG_QUALITY_THRESHOLD gefilterte Baseline-Teilmenge
@@ -406,6 +430,11 @@ def main():
         print(f"    {os.path.relpath(f, REPO_ROOT)}")
     for f in skipped:
         print(f"  ! uebersprungen (gefilterte Baseline-Teilmenge): {os.path.basename(f)}")
+    for f in excluded:
+        print(f"  ! ausgeschlossen (--exclude): {os.path.basename(f)}")
+    if args.recurse:
+        print("  ! --recurse aktiv: liegen unter athleten_daten/sessions/ die .npz zu den"
+              "\n    _all.csv, werden dieselben Spruenge DOPPELT gezaehlt.")
     print("=" * 74)
 
     all_records = []

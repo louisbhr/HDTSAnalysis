@@ -110,6 +110,17 @@ johanna2 70–87, jonas 88–105, jannick 106–121, julian 122–139.
 meldet als hier steht, wurden mehrere Dateien aggregiert — `tools/simulate_feedback.py` druckt
 „GESAMT (alle Dateien)" **nur** bei mehr als einer Datei. Das wurde schon einmal übersehen.
 
+**`.npz` und `_all.csv` sind dieselben Sprünge — ein rekursiver Ordnerlauf zählt doppelt.**
+Belegt am 11.08.: ein Lauf über `athleten_daten/` meldete **707** Sprünge aus 37 Dateien.
+Rechnung: alle `_all.csv` ergeben 345, alle `.npz` unter `sessions/` ergeben 362, Summe 707.
+Beweis der Identität: `jannick-scheibler_all.csv` und `20260703_161633_session.npz` liefern
+beide n = 18 und `trend_median` **bitgenau** `1.8360772695937175`; dasselbe bei `julian` und
+`lydia`. **Konsequenz:** `--recurse` ist seither nicht mehr Default, und der Report warnt, wenn
+es gesetzt ist. Für einen Ordnerlauf gilt: `_all.csv` **oder** `.npz`, nie beides.
+
+**Testdateien gehören nicht in die Kennzahlen.** In `athleten_daten/` liegen neben den echten
+Athleten auch `test*`, `video_test*` und `master_session_daten*`. Mit `--exclude` ausschließen.
+
 ---
 
 ## Referenzwerte aus §5.4 — Datensatz immer mitnennen
