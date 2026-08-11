@@ -7,4 +7,9 @@ __pycache__/
 # Athleten-/Sessiondaten werden zur Laufzeit erzeugt
 athleten_daten/
 
+# Auswertungs-Ausgaben: die Spalte "file" enthaelt Dateinamen der Athletendaten
+# und damit potenziell Klarnamen. Gehoert nicht in ein oeffentliches Repo.
+kennzahlen.csv
+*_kennzahlen.csv
+
 .venv/
