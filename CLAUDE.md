@@ -63,6 +63,7 @@ Die Namen `EARLY`/`LATE` sind firmwareseitig fix — Wording-Änderungen betreff
 | Kein Gold-Fallback im Aufbau | unter 15 Aufbau-Sprüngen nur das diffI-Kriterium |
 | **Gold-Warmstart zeigt GRÜN** | keine Richtung und kein AUS, solange gegen Gold gescort wird (beide Phasen) |
 | **§7.1 Quantil-Totband** | `DEADBAND_MODE = "quantil"`: P70 der letzten 20 **eigenen** trend-Werte je Phase, ab 8 Werten, Leitplanken 0.25/1.20 |
+| **Kein Gold-Leak im Halten-Fallback** | unter 15 Halten-Sprüngen ebenfalls keine Zeile speichern (wie im Aufbau) |
 
 Werte stehen in `importance_utils.py` — **dort ist die Wahrheit**, nicht hier.
 
@@ -120,6 +121,19 @@ es gesetzt ist. Für einen Ordnerlauf gilt: `_all.csv` **oder** `.npz`, nie beid
 
 **Testdateien gehören nicht in die Kennzahlen.** In `athleten_daten/` liegen neben den echten
 Athleten auch `test*`, `video_test*` und `master_session_daten*`. Mit `--exclude` ausschließen.
+
+**Gold-Leak im Halten-Fallback — behoben, belegt am 11.08.** `baseline_manager` schrieb bei
+unter 15 Halten-Sprüngen Gold-Werte **unter dem Athletennamen** in die Baseline-CSV (anders als
+im Aufbau, wo bewusst gar keine Zeile entsteht). `jump_analyzer.load_profile` erkennt
+„individuelle Baseline" allein daran, ob für den Modus überhaupt eine Zeile existiert — der
+Gold-Fallback war dadurch von einer echten eigenen Referenz nicht zu unterscheiden. Ergebnis:
+`is_own=True`, `decide_feedback` gab volles Richtungsfeedback gegen einen **fremden Körper**
+aus — exakt der Fehler aus §5.1.3, nur über einen zweiten Pfad, den der Gold-Warmstart-Fix nicht
+abdeckte. Beleg: `jonas-kaiser` lieferte nach dem Anlegen einer „eigenen" Baseline **bitgenau**
+denselben `trend_median` (1.57) wie zuvor gegen den reinen Goldstandard. Behoben durch dieselbe
+Regel wie im Aufbau: unter `MIN_JUMPS_PER_MODE` keine Zeile speichern, der Loader erkennt den
+Modus dann korrekt als Goldstandard (`is_own=False` → GRÜN, bis die Rolling-Referenz der
+laufenden Session genug eigene Kontakte gesammelt hat). Test l) deckt das ab.
 
 ---
 
@@ -208,11 +222,11 @@ ampel_firmware/       ESP32 (PlatformIO) — wird nicht geändert
 ## Verifikation
 
 ```bash
-python tools/test_refactor.py                      # 11 Tests (a–k), müssen alle grün sein
+python tools/test_refactor.py                      # 12 Tests (a–l), müssen alle grün sein
 python tools/simulate_feedback.py <pfad|ordner> [--profile NAME] [--group-by SPALTE] [--live-check]
 ```
 
-Die Testdatei muss die Fassung mit **a–k** sein. Eine ältere Fassung mit nur a–f ist im Umlauf;
+Die Testdatei muss die Fassung mit **a–l** sein. Eine ältere Fassung mit nur a–f ist im Umlauf;
 ihr fehlen genau die Tests für diffI-Totband, Hysterese-Phase, Rolling-Referenz/MAD-Floor und
 Gold-Warmstart — also für die zuletzt gebauten Teile. Bei 6 Tests: veraltete Datei.
 

@@ -430,6 +430,79 @@ def test_aufbau_fallback_pipeline():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def test_halten_fallback_no_gold_leak():
+    """(l) Zu wenig Halten-Spruenge: KEINE Halten-Zeilen in der Baseline-CSV.
+
+    Fund vom 11.08.: eine frühere Fassung schrieb bei <15 Halten-Spruengen Gold-
+    Werte UNTER DEM ATHLETENNAMEN in die Baseline-CSV. jump_analyzer.load_profile
+    erkennt "individuelle Baseline" allein daran, ob fuer den Modus ueberhaupt eine
+    Zeile existiert - das machte den Gold-Fallback fuer is_own ununterscheidbar von
+    einer echten eigenen Referenz. Ergebnis: decide_feedback gab Richtungsfeedback
+    gegen einen FREMDEN Koerper aus - exakt der Fehler aus Uebergabe 5.1.3, den der
+    Gold-Warmstart-Fix eigentlich beheben sollte, nur ueber einen anderen Pfad.
+    Beleg live: jonas-kaiser lieferte nach dem Anlegen einer "eigenen" Baseline
+    bitgenau denselben trend_median wie zuvor gegen den Goldstandard.
+    """
+    import pandas as pd
+    import baseline_manager
+
+    tmp_dir = tempfile.mkdtemp(prefix="hdts_test_")
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp_dir)
+        shutil.copy(os.path.join(REPO_ROOT, "goldTableNeu.xlsx"), tmp_dir)
+        os.makedirs("athleten_daten", exist_ok=True)
+
+        # 20 Spruenge, alle mit HG > HG_QUALITY_THRESHOLD (-> Aufbau-Modus gut
+        # gefuellt, >=15). Hoehe steigt an: nur die letzten ~4 liegen ueber
+        # 0.9*H_Max_robust (-> Halten-Modus UNTER 15, der Fall aus dem Fund).
+        rng = np.random.default_rng(3)
+        heights = np.linspace(1.0, 3.0, 20)
+        rows = []
+        for h in heights:
+            rows.append({
+                "Peak_t": 0.12 + rng.normal(0, 0.005),
+                "Peak_Prct": 50.0 + rng.normal(0, 2.0),
+                "Explosiv": 6.0e4 + rng.normal(0, 2000),
+                "preSlope": 6.5e4 + rng.normal(0, 2000),
+                "postSlope": -5.5e4 + rng.normal(0, 2000),
+                "Symmetry": 0.9 + rng.normal(0, 0.05),
+                "Height": h,
+                "HG": 0.15 + rng.normal(0, 0.02),
+            })
+        pd.DataFrame(rows).to_csv(os.path.join("athleten_daten", "wenighalten_all.csv"),
+                                  index=False)
+
+        msg = baseline_manager.update_athlete_baseline("wenighalten")
+        assert "Halten" in msg and "kein Referenzsatz" in msg, f"Statusmeldung: {msg}"
+
+        df_b = pd.read_csv(os.path.join("athleten_daten", "wenighalten_baseline.csv"))
+        assert set(df_b["Mode"]) == {"aufbau"}, (
+            f"Baseline-CSV sollte NUR 'aufbau'-Zeilen enthalten, hat: {set(df_b['Mode'])}")
+
+        analyzer = jump_analyzer_module.JumpAnalyzer()
+        analyzer.load_profile("wenighalten", logFcn=lambda m: None)
+        assert analyzer.mode_sources.get("aufbau") == "individuelle Baseline"
+        assert analyzer.mode_sources.get("halten") == "Goldstandard", (
+            "Fehlender Halten-Modus muss als Goldstandard-Quelle erkannt werden "
+            "(-> is_own=False -> GRUEN statt Richtungsfeedback gegen Gold).")
+
+        ref = analyzer._reference_for("halten")
+        assert ref["is_own"] is False, "Gold-Fallback im Halten ist NICHT die eigene Referenz."
+
+        from esp_client import decide_feedback
+        d, lvl, _ = decide_feedback(2.5, 2.6, phase="halten",
+                                    reference_is_own=ref["is_own"])
+        assert (d, lvl) == ("GOOD", 0), (
+            f"Halten-Gold-Fallback muss GRUEN zeigen, nicht Richtung: ({d}, {lvl})")
+
+        print("  OK: Keine Halten-Zeilen bei <15 Halten-Spruengen; Gold-Fallback "
+              "korrekt als fremde Referenz erkannt (GRUEN statt Richtung).")
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def main():
     tests = [
         ("a) Profiler: Contact_t/Integral/diffI", test_profiler_columns_and_diffI),
@@ -443,6 +516,7 @@ def main():
         ("i) Rolling-Referenz + MAD-Floor", test_rolling_reference_and_mad_floor),
         ("j) Gold-Warmstart: GRUEN statt Richtung/AUS", test_gold_warmstart_green),
         ("k) Quantil-Totband (7.1)", test_quantile_deadband),
+        ("l) Halten-Fallback: kein Gold-Leak unter Athletennamen", test_halten_fallback_no_gold_leak),
     ]
 
     failures = 0

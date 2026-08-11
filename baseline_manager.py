@@ -70,25 +70,6 @@ def _hybrid_importance(df_mode, var_names, mode_n, old_importance, old_n, gold_s
     return raw_importance, modus_text
 
 
-def _gold_fallback_row_values(gold_standard_path, var_names):
-    """Median/MAD/Importance direkt vom Goldstandard uebernehmen (Modus-Fallback bei zu wenig Daten).
-
-    GoldStd ist bereits eine Standardabweichung (Sigma-Skala) - hier NICHT nochmal
-    mit MAD_CONSISTENCY multiplizieren, das gilt nur fuer echte (aus Rohdaten
-    berechnete) MAD-Werte.
-    """
-    try:
-        gold = pd.read_excel(gold_standard_path).set_index("Feature")
-        medians = {v: float(gold.loc[v, "GoldMean"]) if v in gold.index else 0.0 for v in var_names}
-        mads = {v: float(gold.loc[v, "GoldStd"]) if v in gold.index else 1.0 for v in var_names}
-        raw_importance = {v: float(gold.loc[v, "Importance"]) if v in gold.index else 0.0 for v in var_names}
-    except Exception:
-        medians = {v: 0.0 for v in var_names}
-        mads = {v: 1.0 for v in var_names}
-        raw_importance = {v: 1.0 for v in var_names}
-    return medians, mads, raw_importance
-
-
 def update_athlete_baseline(athlet_name, gold_standard_path="goldTableNeu.xlsx"):
     """
     BaselineManager: Berechnet ZWEI Referenzsaetze ("aufbau"/"halten") aus der
@@ -170,9 +151,24 @@ def update_athlete_baseline(athlet_name, gold_standard_path="goldTableNeu.xlsx")
                 # nur das diffI-Kriterium.
                 modus_texts.append(f"Aufbau: nur {mode_n} Sprünge – kein Referenzsatz "
                                     f"(Ampel nutzt im Aufbau nur den Höhengewinn)")
-                continue
-            medians, mads, importances_raw = _gold_fallback_row_values(gold_standard_path, VAR_NAMES)
-            modus_texts.append(f"{mode.capitalize()}: Standard-Referenz ({mode_n} Sprünge)")
+            else:
+                # Fund vom 11.08.: eine fruehere Fassung schrieb hier Gold-Werte
+                # UNTER DEM ATHLETENNAMEN in die Baseline. jump_analyzer.load_profile
+                # erkennt "individuelle Baseline" allein daran, ob fuer den Modus
+                # ueberhaupt eine Zeile existiert - das machte den Gold-Fallback fuer
+                # is_own ununterscheidbar von einer echten eigenen Referenz und gab
+                # Richtungsfeedback gegen einen FREMDEN Koerper aus (Uebergabe 5.1.3,
+                # exakt der Fehler, den der Gold-Warmstart-Fix beheben sollte). Beleg:
+                # jonas-kaiser lieferte nach dem Anlegen einer "eigenen" Baseline
+                # bitgenau denselben trend_median wie zuvor gegen den Goldstandard.
+                # Deshalb wie beim Aufbau: keine Zeile speichern. Ohne gespeicherte
+                # Halten-Zeile erkennt der Loader den Modus korrekt als Goldstandard
+                # (is_own=False) -> GRUEN, bis die Rolling-Referenz der laufenden
+                # Session genug eigene Kontakte gesammelt hat (MIN_ROLL).
+                modus_texts.append(f"Halten: nur {mode_n} Sprünge – kein Referenzsatz "
+                                    f"(Ampel startet gegen den Goldstandard, wechselt "
+                                    f"live zur eigenen Referenz)")
+            continue
         else:
             medians, mads = {}, {}
             for var in VAR_NAMES:
