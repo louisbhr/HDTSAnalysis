@@ -295,8 +295,29 @@ sieben Athleten liefen auf `[Profil: global]`, also mit Gold-Warmstart und 100 %
 außerdem mischt er einen Erwachsenen (103 Sprünge, Zielwert 67/25/0/9) mit sechs Kindern
 (Zielwert 88/1/10). Die Zeile `louis_all.csv` ist die aussagekräftige, nicht die GESAMT-Zeile.
 
-**Nächster Schritt:** Baselines für die sechs Kinder anlegen, dann denselben Lauf wiederholen.
-Erst dann ist die Kinder-Gruppe gegen §5.4 (88/1/10) messbar.
+### Kinder-Gruppe mit eigenen Baselines (11.08., nach dem Halten-Fallback-Fix) — Treffer
+
+Nach `tools/build_baselines.py` hatten alle sieben Athleten ein eigenes Profil. Die sechs
+Kinder (ohne `louis`) exakt aus den Kontaktzahlen aufsummiert, nicht aus gerundeten Prozenten:
+
+| Halten (100 Kontakte, 6 Kinder) | hier erreicht | Ziel §5.4 |
+|---|---|---|
+| grün | **88 %** | **88 %** |
+| gelb | **2 %** | **1 %** |
+| blau | **9 %** | **10 %** |
+| aus | **1 %** | – |
+
+**Punktgenauer Treffer.** Sichtbarer Effekt des Halten-Fallback-Fixes an genau der Datei, die er
+betraf: `jonas-kaiser` (einziges Kind mit <15 Halten-Sprüngen im HG-Kriterium) wechselte von
+45 % grün / 55 % gelb (Gold-Leak) auf 82 % grün / 9 % gelb / 9 % blau; alle anderen fünf blieben
+unverändert. Ein gezielter Fix mit gezielter Wirkung, kein flächiges Verschieben.
+
+**Zwei Einschränkungen:** (1) Der Zielwert 88/1/10 stammt aus `data/hdts_knie_gesamt.xlsx`, dem
+kameravalidierten Datensatz — dieser Lauf ist das Live-Werkzeug ohne Kamera. Die Vornamen decken
+sich fast vollständig mit den acht Serien dort (maya, lydia, johanna, jonas, jannick, julian) —
+vermutlich dieselbe Population, an einem anderen Tag mit dem echten Gerät aufgenommen, kein
+unabhängiger Datensatz. (2) `louis_all.csv` bleibt separat (eigener Zielwert 67/25/0/9, siehe
+oben) und geht nicht in diese Rechnung ein.
 
 `--group-by` startet die Referenz je Athlet/Serie neu (Default `auto`: nimmt `Athlet` bzw.
 `Serie`, falls die Spalte existiert). Der Loader erkennt zweizeilige Kopfzeilen und entfernt
