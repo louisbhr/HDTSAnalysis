@@ -415,6 +415,12 @@ def main():
                and os.path.splitext(f)[0] + "_all" in stems]
     files = [f for f in files if f not in skipped]
 
+    # "<name>_baseline.csv" ist das PROFIL des Athleten (Median/MAD/Importance je
+    # Feature), keine Sprungtabelle. Ohne diesen Filter landet es im Datenlauf und
+    # scheitert erst beim Spaltencheck - im Ordnerlauf vom 11.08. genau so passiert.
+    baselines = [f for f in files if os.path.basename(f).lower().endswith("_baseline.csv")]
+    files = [f for f in files if f not in baselines]
+
     print("=" * 74)
     print(f"Warmstart-Profil: {args.profile}   |   Gruppierung: {args.group_by or 'aus'}")
     print(f"Konstanten: DEADBAND_TREND={DEADBAND_TREND}  DIFFI_DEADBAND={DIFFI_DEADBAND}"
@@ -430,6 +436,8 @@ def main():
         print(f"    {os.path.relpath(f, REPO_ROOT)}")
     for f in skipped:
         print(f"  ! uebersprungen (gefilterte Baseline-Teilmenge): {os.path.basename(f)}")
+    for f in baselines:
+        print(f"  ! uebersprungen (Athletenprofil, keine Sprungdaten): {os.path.basename(f)}")
     for f in excluded:
         print(f"  ! ausgeschlossen (--exclude): {os.path.basename(f)}")
     if args.recurse:

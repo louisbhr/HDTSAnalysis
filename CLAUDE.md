@@ -257,9 +257,32 @@ Der Gewinn kommt **nicht** aus einem systematisch kleineren Band (Median 0.48 �
 aus der Anpassung je Kontakt. Bemerkenswert: „aus" fällt von 5 % auf 1 % — genau der Zustand,
 den der Nutzer minimiert haben will, weil ein nicht leuchtendes Gerät wie ein defektes wirkt.
 
-**Der echte Test steht noch aus** und braucht eine Session **mit Athletenprofil**: dann entfallen
-die 6 Warmstart-Kontakte, das Quantil greift ab Kontakt 8, und bei Sessionlängen von 35–68
-Sprüngen (wie in `louis_all.csv`) deckt es den Großteil der Kontakte ab.
+### Erster Lauf mit Athletenprofil (11.08.) — `louis_all.csv`
+
+`louis_all.csv` ist **derselbe Datensatz** wie die §5.4-Zeile „Live-Test" (103 Sprünge, 1
+Erwachsener) und war im Ordnerlauf die einzige Datei mit eigener Baseline (`[Profil: louis]`).
+Damit ist es ein direkter Vorher/Nachher-Vergleich auf identischen Daten:
+
+| Halten (58 Kontakte) | §5.4 vorher | nach dem Umbau |
+|---|---|---|
+| Licht an | 71 % | **75 %** |
+| grün | 67 % | 66 % |
+| gelb | **25 %** | **16 %** |
+| blau | **0 %** | **9 %** |
+| aus | 9 % | 10 % |
+
+**Der einseitige Gelb-Überhang aus §5.1.3 ist beseitigt** — Blau von 0 auf 9 %, Gelb von 25 auf
+16 %, bei praktisch unverändertem Grün- und Aus-Anteil. Richtungsrate 25 % gegen die ~30 %, auf
+die P70 ausgelegt ist. `trend` Median +0.09 bei 44 % negativ (Ziel der Validierungsgruppe:
+−0.04 / 58 %). Das Quantil war hier auf rund 50 der 58 Halten-Kontakte aktiv.
+
+**Der Gesamtwert desselben Laufs (248 Sprünge, 8 Dateien) ist KEIN Kalibriermaßstab.** Sechs der
+sieben Athleten liefen auf `[Profil: global]`, also mit Gold-Warmstart und 100 % Grün im Aufbau;
+außerdem mischt er einen Erwachsenen (103 Sprünge, Zielwert 67/25/0/9) mit sechs Kindern
+(Zielwert 88/1/10). Die Zeile `louis_all.csv` ist die aussagekräftige, nicht die GESAMT-Zeile.
+
+**Nächster Schritt:** Baselines für die sechs Kinder anlegen, dann denselben Lauf wiederholen.
+Erst dann ist die Kinder-Gruppe gegen §5.4 (88/1/10) messbar.
 
 `--group-by` startet die Referenz je Athlet/Serie neu (Default `auto`: nimmt `Athlet` bzw.
 `Serie`, falls die Spalte existiert). Der Loader erkennt zweizeilige Kopfzeilen und entfernt
