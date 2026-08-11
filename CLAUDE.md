@@ -15,6 +15,7 @@ das Instrument — die Kamera war nur Validierungswerkzeug und läuft im Betrieb
 | Frage | Wo steht die Antwort |
 |---|---|
 | Befunde, Zielzustand, offene Entscheidungen | `docs/HDTS_Uebergabe.md` (Stand 06.08.2026) |
+| Was zuletzt gebaut/gemessen wurde, offene To-dos | `docs/HDTS_Stand_2026-08-11.md` |
 | Aktuelle Parameterwerte + Begründung | `importance_utils.py` (Kommentare sind ausführlich) |
 | Ampel-/Text-Entscheidungsbaum | Docstring von `esp_client.decide_feedback` |
 
@@ -114,10 +115,11 @@ meldet als hier steht, wurden mehrere Dateien aggregiert — `tools/simulate_fee
 **`.npz` und `_all.csv` sind dieselben Sprünge — ein rekursiver Ordnerlauf zählt doppelt.**
 Belegt am 11.08.: ein Lauf über `athleten_daten/` meldete **707** Sprünge aus 37 Dateien.
 Rechnung: alle `_all.csv` ergeben 345, alle `.npz` unter `sessions/` ergeben 362, Summe 707.
-Beweis der Identität: `jannick-scheibler_all.csv` und `20260703_161633_session.npz` liefern
-beide n = 18 und `trend_median` **bitgenau** `1.8360772695937175`; dasselbe bei `julian` und
-`lydia`. **Konsequenz:** `--recurse` ist seither nicht mehr Default, und der Report warnt, wenn
-es gesetzt ist. Für einen Ordnerlauf gilt: `_all.csv` **oder** `.npz`, nie beides.
+Beweis der Identität: die `<athlet>_all.csv` eines Athleten und die zugehörige
+`<timestamp>_session.npz` liefern beide n = 18 und `trend_median` **bitgenau**
+`1.8360772695937175`; bei zwei weiteren Athleten dasselbe Muster. **Konsequenz:** `--recurse`
+ist seither nicht mehr Default, und der Report warnt, wenn es gesetzt ist. Für einen Ordnerlauf
+gilt: `_all.csv` **oder** `.npz`, nie beides.
 
 **Testdateien gehören nicht in die Kennzahlen.** In `athleten_daten/` liegen neben den echten
 Athleten auch `test*`, `video_test*` und `master_session_daten*`. Mit `--exclude` ausschließen.
@@ -129,8 +131,8 @@ im Aufbau, wo bewusst gar keine Zeile entsteht). `jump_analyzer.load_profile` er
 Gold-Fallback war dadurch von einer echten eigenen Referenz nicht zu unterscheiden. Ergebnis:
 `is_own=True`, `decide_feedback` gab volles Richtungsfeedback gegen einen **fremden Körper**
 aus — exakt der Fehler aus §5.1.3, nur über einen zweiten Pfad, den der Gold-Warmstart-Fix nicht
-abdeckte. Beleg: `jonas-kaiser` lieferte nach dem Anlegen einer „eigenen" Baseline **bitgenau**
-denselben `trend_median` (1.57) wie zuvor gegen den reinen Goldstandard. Behoben durch dieselbe
+abdeckte. Beleg: der betroffene Athlet lieferte nach dem Anlegen einer „eigenen" Baseline
+**bitgenau** denselben `trend_median` (1.57) wie zuvor gegen den reinen Goldstandard. Behoben durch dieselbe
 Regel wie im Aufbau: unter `MIN_JUMPS_PER_MODE` keine Zeile speichern, der Loader erkennt den
 Modus dann korrekt als Goldstandard (`is_own=False` → GRÜN, bis die Rolling-Referenz der
 laufenden Session genug eigene Kontakte gesammelt hat). Test l) deckt das ab.
@@ -308,7 +310,7 @@ Kinder (ohne `louis`) exakt aus den Kontaktzahlen aufsummiert, nicht aus gerunde
 | aus | **1 %** | – |
 
 **Punktgenauer Treffer.** Sichtbarer Effekt des Halten-Fallback-Fixes an genau der Datei, die er
-betraf: `jonas-kaiser` (einziges Kind mit <15 Halten-Sprüngen im HG-Kriterium) wechselte von
+betraf: das einzige Kind mit unter 15 Halten-Sprüngen im HG-Kriterium wechselte von
 45 % grün / 55 % gelb (Gold-Leak) auf 82 % grün / 9 % gelb / 9 % blau; alle anderen fünf blieben
 unverändert. Ein gezielter Fix mit gezielter Wirkung, kein flächiges Verschieben.
 

@@ -440,7 +440,7 @@ def test_halten_fallback_no_gold_leak():
     einer echten eigenen Referenz. Ergebnis: decide_feedback gab Richtungsfeedback
     gegen einen FREMDEN Koerper aus - exakt der Fehler aus Uebergabe 5.1.3, den der
     Gold-Warmstart-Fix eigentlich beheben sollte, nur ueber einen anderen Pfad.
-    Beleg live: jonas-kaiser lieferte nach dem Anlegen einer "eigenen" Baseline
+    Beleg live: der betroffene Athlet lieferte nach dem Anlegen einer "eigenen" Baseline
     bitgenau denselben trend_median wie zuvor gegen den Goldstandard.
     """
     import pandas as pd

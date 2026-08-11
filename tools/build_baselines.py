@@ -9,7 +9,7 @@ Container leer.
 
 Aufruf:
     python tools/build_baselines.py                  # alle *_all.csv in athleten_daten/
-    python tools/build_baselines.py maya-seitner ...  # nur bestimmte Athleten
+    python tools/build_baselines.py <name> ...        # nur bestimmte Athleten
 """
 import glob
 import os

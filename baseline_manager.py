@@ -159,7 +159,7 @@ def update_athlete_baseline(athlet_name, gold_standard_path="goldTableNeu.xlsx")
                 # is_own ununterscheidbar von einer echten eigenen Referenz und gab
                 # Richtungsfeedback gegen einen FREMDEN Koerper aus (Uebergabe 5.1.3,
                 # exakt der Fehler, den der Gold-Warmstart-Fix beheben sollte). Beleg:
-                # jonas-kaiser lieferte nach dem Anlegen einer "eigenen" Baseline
+                # der betroffene Athlet lieferte nach dem Anlegen einer "eigenen" Baseline
                 # bitgenau denselben trend_median wie zuvor gegen den Goldstandard.
                 # Deshalb wie beim Aufbau: keine Zeile speichern. Ohne gespeicherte
                 # Halten-Zeile erkennt der Loader den Modus korrekt als Goldstandard
