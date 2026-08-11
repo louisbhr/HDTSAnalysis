@@ -312,10 +312,50 @@ def print_report(label, s):
           f"  |  abs: Median {s['abs_median']:.2f}")
 
 
+def resolve_profile(arg_profile, path, gname=None):
+    """Warmstart-Profil je Datei/Serie bestimmen.
+
+    Nur bei --profile auto wird geraten; sonst gilt der uebergebene Name fuer
+    alles. "auto" leitet den Athletennamen aus dem Kontext ab und prueft, ob die
+    Baseline wirklich existiert - sonst faellt es auf "global" (Gold) zurueck.
+
+    Der Grund fuer diese Option: ein einzelnes --profile ueber einen ganzen
+    Ordner wuerde JEDEN Athleten gegen die Baseline EINES Koerpers warmstarten.
+    Die Zwischen-Athleten-Streuung ist laut Uebergabe 3.7 das 2.6- bis 10.4-Fache
+    der Within-Streuung - dieser Lauf waere unbrauchbar.
+
+    Kandidaten in dieser Reihenfolge:
+      1. Gruppenname (Spalte Athlet/Serie) - bei der Validierungs-xlsx
+      2. Ordnername bei athleten_daten/sessions/<name>/*.npz
+      3. Dateiname ohne die Endung "_all"
+    """
+    if str(arg_profile).lower() != "auto":
+        return arg_profile
+
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.endswith("_all"):
+        stem = stem[:-4]
+
+    candidates = []
+    if gname:
+        candidates.append(str(gname))
+    parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
+    if parent and parent not in ("athleten_daten", "data", "sessions"):
+        candidates.append(parent)
+    candidates.append(stem)
+
+    for c in candidates:
+        if os.path.exists(os.path.join("athleten_daten", f"{c}_baseline.csv")):
+            return c
+    return "global"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Simuliert die neue Feedback-Logik auf Sprungdaten.")
     ap.add_argument("path", help="Datei (.csv/.xlsx/.npz) oder Ordner")
-    ap.add_argument("--profile", default="global", help="Warmstart-Profil (Default: global/Gold)")
+    ap.add_argument("--profile", default="global",
+                    help="Warmstart-Profil (Default: global/Gold; 'auto' waehlt je "
+                         "Datei/Serie die passende Baseline, sonst global)")
     ap.add_argument("--live-check", action="store_true",
                     help="Fuer .npz zusaetzlich den echten Live-Pfad gegenpruefen")
     ap.add_argument("--csv", default=None, help="Kennzahlen zusaetzlich als CSV-Zeilen hierhin")
@@ -381,8 +421,13 @@ def main():
         records = []
         for gname, rows in groups:
             label = base if gname is None else f"{base} · {gname}"
+            prof = resolve_profile(args.profile, path, gname)
+            if str(args.profile).lower() == "auto":
+                # Transparent machen, wogegen warmgestartet wurde - "global" heisst
+                # Gold-Warmstart und damit MIN_ROLL gruene Kontakte je Phase.
+                label = f"{label}  [Profil: {prof}]"
             try:
-                grp_records = simulate(rows, profile=args.profile)
+                grp_records = simulate(rows, profile=prof)
             except Exception as e:
                 print(f"\n=== {label} ===\n  FEHLER: {e}")
                 continue
@@ -398,7 +443,7 @@ def main():
 
         if args.live_check and path.lower().endswith(".npz"):
             try:
-                live_seq = live_check(path, profile=args.profile)
+                live_seq = live_check(path, profile=resolve_profile(args.profile, path))
                 sim_seq = [(r["direction"], r["level"]) for r in records]
                 m = min(len(live_seq), len(sim_seq))
                 mism = sum(1 for i in range(m) if live_seq[i] != sim_seq[i])
