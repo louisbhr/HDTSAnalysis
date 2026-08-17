@@ -246,7 +246,14 @@ class AmpelClient:
 
     # ---- Verbinden: USB-Serial ----
     def connect(self, port, baud=115200, handshake_timeout=2.5):
-        """Oeffnet den seriellen Port, wartet auf Boot und macht einen Handshake."""
+        """Oeffnet den seriellen Port, wartet auf Boot und macht einen Handshake.
+
+        Hinweis: aktuell NICHT ueber die GUI erreichbar - der Prototyp laesst
+        keine USB-Verbindung zwischen ESP und Laptop zu, die GUI kennt nur noch
+        WLAN. Der Weg bleibt hier bewusst erhalten (kostet ohne pyserial nichts,
+        das Modul ist weiterhin ohne pyserial importierbar) und kann bei einer
+        spaeteren Hardware-Revision wieder relevant werden.
+        """
         if self.is_connected():
             self._log("Ampel: Bereits verbunden.")
             return True
