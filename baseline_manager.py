@@ -9,13 +9,13 @@ from profiler import HG_QUALITY_THRESHOLD
 # Score-relevante Features (identisch zu profiler.SCORE_VAR_NAMES / jump_analyzer.var_names).
 VAR_NAMES = ["Peak_t", "Peak_Prct", "Explosiv", "preSlope", "postSlope", "Symmetry"]
 
-# Mindestanzahl Spruenge pro Modus. Unterschreitung:
-#   * "halten": Fallback auf den Goldstandard (Median/MAD/Importance)
-#   * "aufbau": KEIN Fallback - es werden keine Aufbau-Zeilen gespeichert.
-#     Der Goldstandard beschreibt Steady-State-Kontakte und waere als
-#     Aufbau-Referenz genau falsch; die Ampel faehrt dann im Aufbau nur das
-#     diffI-Kriterium (siehe esp_client.classify_ampel), Richtungslichter
-#     erst, sobald die Aufbau-Baseline steht.
+# Mindestanzahl Spruenge pro Modus. Unterschreitung: In BEIDEN Modi wird KEINE
+# Zeile gespeichert (Fund vom 11.08., siehe die ausfuehrliche Begruendung unten
+# im Halten-Zweig). Der Loader erkennt den fehlenden Modus dann als Goldstandard:
+#   * "aufbau": die Ampel faehrt nur das diffI-Kriterium (siehe
+#     esp_client.decide_feedback), Richtungslichter erst mit eigener Baseline.
+#   * "halten": is_own=False -> GRUEN, bis die Rolling-Referenz der laufenden
+#     Session genug eigene Kontakte gesammelt hat.
 MIN_JUMPS_PER_MODE = 15
 
 # H_Max_robust = dieses Perzentil der Height-Spalte (statt max(), damit ein einzelner

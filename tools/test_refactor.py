@@ -17,7 +17,7 @@ Getestet wird:
   c) Eine alte Baseline-CSV ohne "Mode"-Spalte wird rueckwaertskompatibel geladen
      (jump_analyzer.load_profile UND profiler.load_scoring_profile).
   d) Phasen-Weiche: h_rel 0.5 -> "aufbau", h_rel 0.95 -> "halten".
-  e) Ampel-Logik (esp_client.classify_ampel): alle 8 Zweige (4 je Phase) plus
+  e) Ampel-Logik (esp_client.decide_feedback): alle 8 Zweige (4 je Phase) plus
      Aufbau-Fallback ohne individuelle Aufbau-Baseline.
   f) Aufbau-Fallback in der Pipeline: baseline_manager speichert bei zu wenigen
      Aufbau-Spruengen KEINE Aufbau-Zeilen (kein Goldstandard-Fallback fuer
@@ -159,10 +159,14 @@ def test_ampel_logic():
     """(e) 8 Zweige der phasenabhaengigen Feedback-Logik + Aufbau-Fallback.
 
     Geprueft wird decide_feedback (LED + Text in EINER Funktion): (direction, level)
-    UND dass der Text zur Richtung passt (keine Aufbau-Divergenz mehr). classify_ampel
-    ist der duenne Wrapper und muss die ersten beiden Werte spiegeln.
+    UND dass der Text zur Richtung passt (keine Aufbau-Divergenz mehr).
+
+    Der frueher hier mitgepruefte Wrapper classify_ampel ist entfernt: er rief
+    decide_feedback ohne reference_is_own und ohne deadband auf und haette einem
+    kuenftigen Aufrufer stillschweigend andere Ergebnisse geliefert als die
+    Live-Ampel. decide_feedback ist jetzt der einzige Einstieg.
     """
-    from esp_client import decide_feedback, classify_ampel
+    from esp_client import decide_feedback
     from importance_utils import DIFFI_DEADBAND
 
     GOOD_DIFFI = DIFFI_DEADBAND + 10.0   # sicher ueber dem diffI-Totband (GRUEN)
@@ -172,8 +176,6 @@ def test_ampel_logic():
         direction, level, text = decide_feedback(*args[0], **args[1])
         assert (direction, level) == (expected_dir, expected_level), (args, direction, level)
         assert text_contains in text, (text, text_contains)
-        # Wrapper muss die ersten beiden Werte identisch liefern.
-        assert classify_ampel(*args[0], **args[1]) == (direction, level)
 
     # --- Phase "halten" ---
     check(((0.2, 1.0), dict(phase="halten")), "GOOD", 0, "stabil")                 # Totband

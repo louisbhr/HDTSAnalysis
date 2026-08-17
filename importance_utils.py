@@ -100,6 +100,14 @@ MIN_ROLL = 6
 # aus kleinen, homogenen Teilmengen (individuelle MADs koennen absurd eng werden).
 MAD_FLOOR_FACTOR = 0.30
 
+# --- Mindestanzahl bewertbarer Features -----------------------------------
+# compute_jump_score schliesst Features aus, fuer die kein z-Wert berechenbar ist
+# (Messwert/Referenz/Streuung nicht finit oder Streuung <= 0). Bleiben weniger als
+# MIN_VALID_FEATURES uebrig, ist der Sprung nicht bewertbar: aus ein oder zwei von
+# sechs Features darf keine Richtungsansage entstehen, auch wenn die Gewichte
+# rechnerisch auf 1.0 normiert wuerden.
+MIN_VALID_FEATURES = 3
+
 
 def effective_deadband(trend_history):
     """Wirksames Trend-Totband aus der eigenen juengsten |trend|-Verteilung.
@@ -229,6 +237,23 @@ def step_label(abs_score):
     return "etwas"
 
 
+def _feature_is_scorable(feature, current_features, reference, deviation):
+    """Prueft, ob fuer ein Feature ueberhaupt ein z-Wert berechenbar ist.
+
+    EINE Wahrheit fuer die Vorauswahl in compute_jump_score und den Guard in der
+    Schleife - beide rufen diese Funktion auf, damit die Kriterien nicht
+    auseinanderlaufen koennen.
+    """
+    cur = current_features.get(feature, np.nan)
+    ref = reference.get(feature, np.nan)
+    dev = deviation.get(feature, np.nan)
+    try:
+        cur, ref, dev = float(cur), float(ref), float(dev)
+    except (TypeError, ValueError):
+        return False
+    return (np.isfinite(cur) and np.isfinite(ref) and np.isfinite(dev) and dev > 0.0)
+
+
 def compute_jump_score(current_features, reference, deviation, importance,
     direction, feature_order):
     """Berechnet Trend- und Absolut-Score fuer einen einzelnen Sprung.
@@ -245,37 +270,76 @@ def compute_jump_score(current_features, reference, deviation, importance,
         trend_score   : Summe( delta_i * importance_i * direction_i )   (mit Vorzeichen)
         abs_score     : Summe( |delta_i| * importance_i )               (ohne Vorzeichen)
         max_abs_delta : groesste absolute Einzelabweichung (in Std/MAD), z-Trigger
-        details       : Liste von dicts pro Feature (fuer Debug-Logs)
+        n_used        : Anzahl tatsaechlich bewerteter Features
+        details       : Liste von dicts pro Feature (fuer Debug-Logs), IMMER ueber
+                        das vollstaendige feature_order - verworfene Features
+                        stehen mit Importance_norm = 0.0 und Delta_z = 0.0 drin
+
+    Nur Features, fuer die ein z-Wert wirklich berechenbar ist (Messwert,
+    Referenz und Streuung finit, Streuung > 0), gehen in die Bewertung ein - sie
+    werden AUSGESCHLOSSEN, nicht mit delta = 0 mitgewichtet. Der Unterschied ist
+    nicht kosmetisch: ein mitgewichtetes NaN-Feature verbucht seinen
+    Gewichtsanteil als "perfekt unauffaellig" und drueckt abs_score systematisch
+    nach unten (bei imp = 0.25 um ein Viertel). Die Schwellen 1.4/1.9 und das
+    Konsistenzverhaeltnis |trend|/abs sind aber auf der UNVERDUENNTEN Skala
+    kalibriert. Durch den Ausschluss VOR der Normalisierung skalieren die
+    Gewichte der uebrigen Features wieder auf 1.0, und abs_score behaelt seine
+    Bedeutung als gewichtetes Mittel der |z|-Abweichungen.
+
+    Unter MIN_VALID_FEATURES gueltigen Features gilt der Sprung als nicht
+    bewertbar (alle Scores 0.0) - aus ein oder zwei Features darf keine
+    Richtungsansage entstehen.
 
     Es wird garantiert: keine Division durch 0, kein NaN/Inf im Ergebnis.
     """
-    # Nur Features verwenden, die in allen Quellen vorhanden sind.
-    used = [f for f in feature_order if f in current_features]
+    # Vorauswahl: nur Features, fuer die ein z-Wert berechenbar ist. Bewusst VOR
+    # der Normalisierung, damit die Gewichte der Verbleibenden auf 1.0 skalieren.
+    used = [f for f in feature_order
+            if _feature_is_scorable(f, current_features, reference, deviation)]
+
+    def _empty_detail(f):
+        return {
+            "Feature": f,
+            "Wert": current_features.get(f, np.nan),
+            "Referenz": reference.get(f, np.nan),
+            "Streuung": deviation.get(f, np.nan),
+            "Delta_z": 0.0,
+            "Importance_norm": 0.0,
+            "Gewichteter_Anteil": 0.0,
+        }
+
+    # Zu wenig verwertbare Features -> kein Score. Der Aufrufer erkennt das an
+    # n_used und unterdrueckt die Richtungsansage.
+    if len(used) < MIN_VALID_FEATURES:
+        return {
+            "trend_score": 0.0,
+            "abs_score": 0.0,
+            "max_abs_delta": 0.0,
+            "n_used": len(used),
+            "details": [_empty_detail(f) for f in feature_order],
+        }
 
     # Importances der genutzten Features einsammeln und zentral auf 1.0 normieren.
     raw_imp = {f: importance.get(f, 0.0) for f in used}
     norm_imp = normalize_importance(raw_imp, feature_names=used, target_sum=TARGET_IMPORTANCE_SUM)
 
-    details = []
+    by_feature = {}
     trend_score = 0.0
     abs_score = 0.0
     max_abs_delta = 0.0
 
     for f in used:
-        cur = current_features.get(f, np.nan)
-        ref = reference.get(f, np.nan)
-        dev = deviation.get(f, np.nan)
+        cur = float(current_features.get(f, np.nan))
+        ref = float(reference.get(f, np.nan))
+        dev = float(deviation.get(f, np.nan))
         dir_mult = float(direction.get(f, 1))
         imp = float(norm_imp.get(f, 0.0))
 
         # Delta als z-Wert (Abweichung in Standardabweichungen / MAD).
-        # Schutz vor Division durch 0 und ungueltigen Werten.
-        if (not np.isfinite(cur)) or (not np.isfinite(ref)) or (not np.isfinite(dev)) or dev <= 0.0:
+        # Gueltigkeit ist durch die Vorauswahl oben bereits sichergestellt.
+        delta = (cur - ref) / dev
+        if not np.isfinite(delta):
             delta = 0.0
-        else:
-            delta = (cur - ref) / dev
-            if not np.isfinite(delta):
-                delta = 0.0
 
         weighted = abs(delta) * imp        # Beitrag zum Absolut-Score
         trend_contrib = delta * imp * dir_mult
@@ -284,7 +348,7 @@ def compute_jump_score(current_features, reference, deviation, importance,
         abs_score += weighted
         max_abs_delta = max(max_abs_delta, abs(delta))
 
-        details.append({
+        by_feature[f] = {
             "Feature": f,
             "Wert": cur,
             "Referenz": ref,
@@ -292,7 +356,11 @@ def compute_jump_score(current_features, reference, deviation, importance,
             "Delta_z": delta,
             "Importance_norm": imp,
             "Gewichteter_Anteil": weighted,
-        })
+        }
+
+    # details ueber das VOLLSTAENDIGE feature_order, damit format_debug_table
+    # weiterhin alle Features zeigt und man verworfene sofort erkennt.
+    details = [by_feature.get(f) or _empty_detail(f) for f in feature_order]
 
     # Endgueltige Saeuberung der Aggregate.
     trend_score = float(trend_score) if np.isfinite(trend_score) else 0.0
@@ -303,6 +371,7 @@ def compute_jump_score(current_features, reference, deviation, importance,
         "trend_score": trend_score,
         "abs_score": abs_score,
         "max_abs_delta": max_abs_delta,
+        "n_used": len(used),
         "details": details,
     }
 

@@ -39,7 +39,7 @@ import socket
 import threading
 
 # pyserial ist optional: nur fuer den USB-Transport noetig. Ohne pyserial bleibt
-# das Modul importierbar (WLAN + classify_ampel funktionieren trotzdem).
+# das Modul importierbar (WLAN + decide_feedback funktionieren trotzdem).
 try:
     import serial
     import serial.tools.list_ports
@@ -87,6 +87,16 @@ def _direction_text(direction, level):
     return f"{stepword(level)} später treten"
 
 
+def _consistency(trend_score, abs_score):
+    """Anteil des Absolut-Scores, den der gerichtete Trend erklaert.
+
+    Nahe 1: alle Einzelabweichungen zeigen in dieselbe Richtung -> klare Ansage.
+    Nahe 0: sie heben sich gegenseitig auf -> keine eindeutige Ansage moeglich.
+    EINE Wahrheit fuer beide Phasen (siehe Konsistenz-Gate in decide_feedback).
+    """
+    return (abs(trend_score) / abs_score) if abs_score > 0 else 0.0
+
+
 def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
                     aufbau_reference_ok=True, reference_is_own=True,
                     deadband=None):
@@ -112,10 +122,14 @@ def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
     Phase "aufbau" (Score gegen die AUFBAU-Referenz):
         diffI > DIFFI_DEADBAND                        -> GOOD  ("Hoehe kommt")
         sonst, ohne Aufbau-Baseline                  -> OFF   ("kein Signal")
-        sonst, diffI = NaN (erster Sprung)           -> OFF   ("erster Sprung")
+        sonst, diffI = NaN (erster Sprung)           -> GOOD  ("erster Sprung")
         sonst, |trend| < deadband                    -> OFF   ("mehr Druck ins Tuch")
+        sonst, Gate verletzt                         -> OFF   ("uneinheitlich")
         sonst, trend > +deadband                     -> EARLY (frueher treten)
         sonst, trend < -deadband                     -> LATE  (spaeter treten)
+
+    Das Konsistenz-Gate (|trend|/abs > CONSISTENCY_GATE) gilt in BEIDEN Phasen:
+    heben sich die Einzelabweichungen gegenseitig auf, gibt es keine Richtung.
 
     Fallback ohne individuelle Aufbau-Baseline: Der Goldstandard beschreibt
     Steady-State-Kontakte und waere als Aufbau-Referenz genau falsch. Daher NUR
@@ -174,27 +188,21 @@ def decide_feedback(trend_score, abs_score, phase="halten", diffI=None,
             return ("GOOD", 0, "erster Sprung")
         if abs(trend_score) < band:
             return ("OFF", 0, "mehr Druck ins Tuch")
+        # Konsistenz-Gate auch im Aufbau: heben sich die Einzelabweichungen
+        # weitgehend auf, traegt der Trend keine klare Ansage - das Argument gilt
+        # phasenunabhaengig, deshalb dieselbe Konstante wie im Halten.
+        if _consistency(trend_score, abs_score) <= CONSISTENCY_GATE:
+            return ("OFF", 0, "Abweichung uneinheitlich")
         direction, level = _direction_state(trend_score, abs_score)
         return (direction, level, _direction_text(direction, level))
 
     # Phase "halten"
     if abs(trend_score) < band:
         return ("GOOD", 0, "Timing stabil")
-    consistency = (abs(trend_score) / abs_score) if abs_score > 0 else 0.0
-    if consistency <= CONSISTENCY_GATE:
+    if _consistency(trend_score, abs_score) <= CONSISTENCY_GATE:
         return ("OFF", 0, "Abweichung uneinheitlich")
     direction, level = _direction_state(trend_score, abs_score)
     return (direction, level, _direction_text(direction, level))
-
-
-def classify_ampel(trend_score, abs_score, phase="halten", diffI=None,
-                   aufbau_reference_ok=True):
-    """Duenner Wrapper um decide_feedback fuer Aufrufer, die nur (direction, level)
-    brauchen. EINZIGE Entscheidungslogik lebt in decide_feedback."""
-    direction, level, _text = decide_feedback(
-        trend_score, abs_score, phase=phase, diffI=diffI,
-        aufbau_reference_ok=aufbau_reference_ok)
-    return (direction, level)
 
 
 class _ConnLost(Exception):

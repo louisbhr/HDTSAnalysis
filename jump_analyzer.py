@@ -9,7 +9,7 @@ from importance_utils import (
     normalize_importance, compute_jump_score, MAD_CONSISTENCY,
     ROLL_N, MIN_ROLL, MAD_FLOOR_FACTOR,
     HG_AUFBAU_ENTRY, HG_AUFBAU_MEAN3, HYSTERESE_EXIT,
-    DEADBAND_WINDOW, effective_deadband,
+    DEADBAND_WINDOW, effective_deadband, MIN_VALID_FEATURES,
 )
 
 # Feedback-Entscheidung (LED + Text in EINER Funktion) aus esp_client. Optional -
@@ -157,14 +157,30 @@ class JumpAnalyzer:
             mode = self._build_mode_dict(medians, mads, importances)
             return mode, 4.5
 
-    def _load_gold_std(self):
-        """Liest GoldStd je Feature (fuer den MAD-Floor). Bei Fehler leeres dict."""
+    def _load_gold_std(self, logFcn=print):
+        """Liest GoldStd je Feature (fuer den MAD-Floor). Bei Fehler leeres dict.
+
+        Faellt der Read aus, ist _apply_mad_floor ein reiner Durchlauf - die
+        Absicherung gegen z-Explosion aus sehr engen Session-MADs fehlt dann
+        still. Deshalb wird jeder Ausfall EINMAL beim Laden des Profils
+        gemeldet (nicht pro Sprung), sowohl der komplette als auch einzelne
+        Features ohne gueltigen GoldStd. Rein informativ: kein Abbruch, kein
+        Ersatz-Floor.
+        """
         try:
             gold = pd.read_excel("goldTableNeu.xlsx").set_index("Feature").reindex(self.var_names)
-            return {var: float(gold.loc[var, "GoldStd"]) for var in self.var_names
-                    if np.isfinite(gold.loc[var, "GoldStd"])}
-        except Exception:
+            out = {var: float(gold.loc[var, "GoldStd"]) for var in self.var_names
+                   if np.isfinite(gold.loc[var, "GoldStd"])}
+        except Exception as e:
+            logFcn(f"Warnung: Standard-Streuungen nicht lesbar ({e}). MAD-Floor ist "
+                   f"inaktiv – Streuungen werden nicht nach unten begrenzt.")
             return {}
+
+        fehlend = [var for var in self.var_names if var not in out]
+        if fehlend:
+            logFcn(f"Warnung: Für {', '.join(fehlend)} fehlt eine Standard-Streuung. "
+                   f"Für diese Merkmale greift der MAD-Floor nicht.")
+        return out
 
     # ---- 1c. MAD-Floor + Referenzaufbau (Rolling ODER Warmstart) ----
     def _apply_mad_floor(self, deviation):
@@ -188,6 +204,12 @@ class JumpAnalyzer:
         dem Fenster (tagesformrobust, loest den Gold-Fallback-Schiefstand). Davor
         Warmstart aus der gespeicherten Baseline. Importance stammt in beiden Faellen
         aus der gespeicherten Baseline. MAD-Floor wird immer angewandt.
+
+        Je Feature gilt im Rolling-Fall die Kette
+            Fenster -> gespeicherte Baseline -> Feature weglassen.
+        Ein weggelassenes Feature fehlt in "reference"/"deviation" und wird von
+        compute_jump_score aussortiert; die Gewichte der uebrigen skalieren neu
+        auf 1.0. Das ist bewusst so: keine Referenz heisst keine Bewertung.
         """
         stored = self.profiles.get(phase) or self.profiles.get("halten")
         window = self._roll.get(phase)
@@ -196,13 +218,36 @@ class JumpAnalyzer:
             for f in self.var_names:
                 vals = np.array([row[f] for row in window
                                  if f in row and np.isfinite(row[f])], dtype=float)
+                # Fallback-Kette je Feature: Rolling-Fenster -> gespeicherte
+                # Baseline -> Feature ganz weglassen. NIE auf 0.0/1.0 ausweichen:
+                # ein Feature, das im Fenster nie gueltig war, haette dann
+                # delta = (cur - 0) / 1.0 - bei Explosiv (Groessenordnung ~15000)
+                # sind das vierstellige z-Werte, die trend und abs komplett
+                # dominieren. Fehlt eine Referenz, ist "nicht bewerten" richtig,
+                # nicht "gegen 0 bewerten"; compute_jump_score filtert Features
+                # ohne Referenz automatisch aus und skaliert die Gewichte neu.
+                med = mad = None
                 if len(vals) > 0:
                     med = float(np.median(vals))
                     mad = float(np.median(np.abs(vals - med))) * MAD_CONSISTENCY
-                    ref[f] = med
-                    dev[f] = mad if mad > 0 else 1e-6
-                else:
-                    ref[f], dev[f] = 0.0, 1.0
+
+                if med is not None and mad is not None and mad > 0:
+                    ref[f], dev[f] = med, mad
+                    continue
+
+                # Fenster unbrauchbar (kein gueltiger Wert oder MAD = 0):
+                # gespeicherte Baseline verwenden, falls sie das Feature kennt.
+                s_ref = stored["reference"].get(f, np.nan)
+                s_dev = stored["deviation"].get(f, np.nan)
+                try:
+                    s_ref, s_dev = float(s_ref), float(s_dev)
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(s_ref) and np.isfinite(s_dev) and s_dev > 0:
+                    # Median darf aus dem Fenster stammen, wenn er gueltig ist -
+                    # nur die Streuung kommt dann aus der Baseline.
+                    ref[f] = med if med is not None else s_ref
+                    dev[f] = s_dev
             # Rolling: die Referenz besteht aus Kontakten DIESER Session, also aus
             # dem eigenen Koerper -> Richtungsansagen sind hier gueltig.
             return {"reference": ref,
@@ -297,8 +342,9 @@ class JumpAnalyzer:
         self.profiles = profiles
         self.mode_sources = dict(mode_sources)
         self.h_max = h_max if h_max is not None else 4.5
-        # GoldStd je Feature fuer den MAD-Floor bereitstellen.
-        self._gold_std = self._load_gold_std()
+        # GoldStd je Feature fuer den MAD-Floor bereitstellen. logFcn mitgeben,
+        # damit ein Ausfall des Floors nicht still bleibt (einmal beim Laden).
+        self._gold_std = self._load_gold_std(logFcn)
 
         src_txt = {"individuelle Baseline": "individuell", "Goldstandard": "Standard"}
         a_src = src_txt.get(mode_sources.get("aufbau"), "Standard")
@@ -557,7 +603,14 @@ class JumpAnalyzer:
             # (Uebergabe 7.1). Vor DEADBAND_MIN_N eigenen Werten liefert
             # effective_deadband den Fixwert - kein Sonderfall noetig.
             band = effective_deadband(self._trend_hist[phase])
-            if decide_feedback is not None:
+            n_used = int(result.get("n_used", len(self.var_names)))
+            if n_used < MIN_VALID_FEATURES:
+                # Zu wenige bewertbare Features (compute_jump_score liefert dann
+                # Scores 0.0). Hier bewusst NICHT ueber reference_is_own gehen -
+                # das beschreibt die HERKUNFT der Referenz, nicht die Datenlage.
+                # Stattdessen direkt GRUEN: sichtbar, aber ohne Richtungsansage.
+                direction, level, coaching_output = ("GOOD", 0, "zu wenig Messwerte")
+            elif decide_feedback is not None:
                 direction, level, coaching_output = decide_feedback(
                     trend_score, abs_score, phase=phase, diffI=diffI,
                     aufbau_reference_ok=ref_is_own,

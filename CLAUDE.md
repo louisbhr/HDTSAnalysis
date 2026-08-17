@@ -46,7 +46,9 @@ exakt `100 × Peak_t` → perfekte Kollinearität).
 
 **Zentraler Vertrag:** `decide_feedback(trend, abs, phase, diffI, aufbau_reference_ok,
 reference_is_own, deadband)` gibt `(direction, level, text)` zurück. Text und LED stammen zwingend aus demselben Aufruf.
-`classify_ampel` ist nur noch ein dünner Wrapper für Rückwärtskompatibilität.
+Es ist der **einzige** Einstieg — der frühere Wrapper `classify_ampel` ist entfernt (er rief
+ohne `reference_is_own`/`deadband` auf und wich damit von der Live-Ampel ab).
+Das **Konsistenz-Gate gilt in beiden Phasen**, ebenso das Totband.
 Protokoll zur Firmware: `SHOW EARLY <1..3>` / `SHOW LATE <1..3>` / `SHOW GOOD` / `OFF`.
 Die Namen `EARLY`/`LATE` sind firmwareseitig fix — Wording-Änderungen betreffen nur die GUI.
 
