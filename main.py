@@ -33,10 +33,33 @@ TRAMPOLIN_STYLE_ACTIVE = (
 )
 
 
+# Aktiver Zustand des kleinen Bearbeiten-Icons (Akzentfarbe statt Grau).
+# Bewusst NICHT TRAMPOLIN_STYLE_ACTIVE: dessen padding/border wuerde das auf
+# CONN_ICON_SIZE geschrumpfte Icon-Feld ueberfuellen.
+ICON_BUTTON_ACTIVE = (
+    "background-color: #00B0FF; border: none; border-radius: 6px; padding: 4px;"
+)
+
+
 # Stil fuer den Verbindungs-Status ("Getrennt" rot, "Verbunden" gruen).
 # Wird sowohl fuer die Ampel- als auch die Qira-Statuszeile genutzt.
 AMPEL_STATUS_DISCONNECTED = "color: #FF3B30; font-weight: bold;"
 AMPEL_STATUS_CONNECTED = "color: #00E676; font-weight: bold;"
+
+# --- Masse der beiden Verbindungs-Panels (Qira / Ampel) -------------------
+# Die Panels sollen zeilenweise auf gleicher Hoehe liegen: Titel, Infozeile,
+# Button und Status jeweils buendig. Dafuer braucht es feste Masse statt der
+# Standardhoehen, denn sonst macht schon das Bearbeiten-Icon die Titelzeile der
+# Ampel hoeher als die des Qira-Panels.
+CONN_TITLE_ROW_HEIGHT = 32   # feste Titelzeile - traegt Titel UND ggf. das Icon
+CONN_BUTTON_HEIGHT = 40      # beide Verbinden-Buttons, frueher 46 vs. ~35
+CONN_PANEL_SPACING = 8       # enger als die Standard-12 der uebrigen Karten
+CONN_ICON_SIZE = 28          # Bearbeiten-Icon, passt damit in die Titelzeile
+
+# Adresse des Qira-Websockets. Zentral, weil die Infozeile im Panel denselben
+# Wert zeigt wie der Verbindungsaufbau - sonst laufen Anzeige und Realitaet
+# auseinander.
+QIRA_URL = "ws://localhost:8081"
 
 # Protokoll: Farbe je Wichtigkeit (info neutral-grau, success gruen, warning gelb, error rot).
 LOG_COLORS = {
@@ -99,7 +122,7 @@ class MainWindow(QMainWindow):
         # ---- 2. Qira-Client und JumpAnalyzer ----
         self._qira_connected = False
         self.client = QiraClient(
-            url="ws://localhost:8081", logFcn=self.bridge.log_signal.emit,
+            url=QIRA_URL, logFcn=self.bridge.log_signal.emit,
             on_connection_changed=self.bridge.qira_connection_signal.emit)
         self.analyzer = JumpAnalyzer()
 
@@ -146,6 +169,27 @@ class MainWindow(QMainWindow):
                 inner.addWidget(lbl)
             return card, inner
 
+        def make_title_row(title, trailing=None):
+            """Titelzeile fester Hoehe: Titel links, optional ein Bedienelement rechts.
+
+            Die feste Hoehe ist der Kern der Ausrichtung: ein Icon rechts darf die
+            Zeile nicht hoeher machen als eine Zeile ohne Icon, sonst verschiebt
+            sich im Ampel-Panel alles darunter gegenueber dem Qira-Panel.
+            """
+            row = QWidget()
+            row.setObjectName("panelRow")
+            row.setFixedHeight(CONN_TITLE_ROW_HEIGHT)
+            lay = QHBoxLayout(row)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(12)
+            lbl = QLabel(title)
+            lbl.setObjectName("sectionTitle")
+            lay.addWidget(lbl)
+            lay.addStretch(1)
+            if trailing is not None:
+                lay.addWidget(trailing)
+            return row
+
         # ===============================================================
         # Raster mit zwei Spalten und drei Zeilen (danach breit Dashboard + Log):
         #   Zeile 1: Verbindung Qira      | Verbindung Ampel
@@ -156,11 +200,23 @@ class MainWindow(QMainWindow):
         # ===============================================================
 
         # --- Zeile 1 links: Verbindung Qira (kompakt) ---
-        qira_card, qira_layout = make_card("Verbindung Qira")
+        # Aufbau identisch zum Ampel-Panel rechts: Titelzeile, Infozeile, Button,
+        # Status - nur so liegen beide Panels zeilenweise auf gleicher Hoehe.
+        qira_card, qira_layout = make_card()
+        qira_layout.setSpacing(CONN_PANEL_SPACING)
+        qira_layout.addWidget(make_title_row("Verbindung Qira"))
+
+        # Infozeile: Gegenstueck zur IP-Zeile der Ampel. Zeigt, womit verbunden
+        # wird - bisher stand die Adresse nur im Code.
+        self.lbl_qira_target = QLabel(f"WebSocket  ·  {QIRA_URL.split('//', 1)[-1]}")
+        self.lbl_qira_target.setObjectName("mutedInfo")
+        qira_layout.addWidget(self.lbl_qira_target)
+
         self.btn_connect = QPushButton("Mit Qira verbinden")
         self.btn_connect.setObjectName("primaryButton")
         self.btn_connect.setIcon(qta.icon("msc.link", color="white"))
         self.btn_connect.setIconSize(QSize(20, 20))
+        self.btn_connect.setMinimumHeight(CONN_BUTTON_HEIGHT)
         self.btn_connect.clicked.connect(self.start_connection)
         qira_layout.addWidget(self.btn_connect)
         self.lbl_qira_status = QLabel("Getrennt")
@@ -168,26 +224,27 @@ class MainWindow(QMainWindow):
         qira_layout.addWidget(self.lbl_qira_status)
 
         # --- Zeile 1 rechts: Verbindung Ampel ---
-        ampel_card, ampel_layout = make_card("Verbindung Ampel")
+        ampel_card, ampel_layout = make_card()
+        ampel_layout.setSpacing(CONN_PANEL_SPACING)
 
-        # Kleiner Bearbeiten-Button. Normalfall: die IP ist voreingestellt, die
-        # editierbare Zeile erscheint erst im Bearbeitungs-Modus.
+        # Kleiner Bearbeiten-Button, direkt in der Titelzeile. Normalfall: die IP
+        # ist voreingestellt, die editierbare Zeile erscheint erst im
+        # Bearbeitungs-Modus. Er sitzt bewusst IN der Titelzeile fester Hoehe und
+        # nicht mehr in einer eigenen Zeile darunter - die gab es nur hier und
+        # verschob alles darunter gegenueber dem Qira-Panel.
         # Transport ist ausschliesslich WLAN - der aktuelle Prototyp laesst keine
         # USB-Verbindung zwischen ESP und Laptop mehr zu. Ein Umschalter waere
         # damit toter Ballast und eine Fehlerquelle (Nutzer waehlt USB, Verbindung
         # schlaegt zwangslaeufig fehl).
-        ampel_mode_row = QHBoxLayout()
-        ampel_mode_row.setSpacing(12)
-        ampel_mode_row.addStretch(1)
         self.btn_ampel_edit = QPushButton()
         self.btn_ampel_edit.setObjectName("iconButton")
         self.btn_ampel_edit.setIcon(qta.icon("msc.edit", color="#C8C8CC"))
-        self.btn_ampel_edit.setIconSize(QSize(18, 18))
-        self.btn_ampel_edit.setFixedWidth(44)
+        self.btn_ampel_edit.setIconSize(QSize(16, 16))
+        self.btn_ampel_edit.setFixedSize(CONN_ICON_SIZE, CONN_ICON_SIZE)
         self.btn_ampel_edit.setToolTip("IP bearbeiten")
         self.btn_ampel_edit.clicked.connect(self.toggle_ampel_edit)
-        ampel_mode_row.addWidget(self.btn_ampel_edit)
-        ampel_layout.addLayout(ampel_mode_row)
+        ampel_layout.addWidget(
+            make_title_row("Verbindung Ampel", trailing=self.btn_ampel_edit))
 
         # Kompakte Infozeile (Normalmodus): zeigt, womit verbunden wird.
         self.lbl_ampel_target = QLabel("")
@@ -196,6 +253,7 @@ class MainWindow(QMainWindow):
 
         # WLAN-Zeile: IP-Feld (Standard: Access-Point-IP der Firmware; nur im Edit-Modus).
         self.ampel_wifi_row = QWidget()
+        self.ampel_wifi_row.setObjectName("panelRow")
         wifi_row_layout = QHBoxLayout(self.ampel_wifi_row)
         wifi_row_layout.setContentsMargins(0, 0, 0, 0)
         wifi_row_layout.setSpacing(12)
@@ -207,13 +265,14 @@ class MainWindow(QMainWindow):
         ampel_layout.addWidget(self.ampel_wifi_row)
         self.ampel_wifi_row.setVisible(False)
 
-        # Flexibler Abstand: haelt Verbinden-Button + Status am unteren Kartenrand.
-        ampel_layout.addStretch(1)
+        # Kein addStretch mehr: das Panel hat jetzt genau so viele Zeilen wie das
+        # Qira-Panel und soll seine Hoehe aus dem Inhalt beziehen, nicht Button
+        # und Status an einen unteren Rand schieben.
 
         # Verbinden-Button + Statuszeile
         self.btn_ampel_connect = QPushButton("Mit Ampel verbinden")
         self.btn_ampel_connect.setObjectName("primaryButton")
-        self.btn_ampel_connect.setMinimumHeight(46)
+        self.btn_ampel_connect.setMinimumHeight(CONN_BUTTON_HEIGHT)
         self.btn_ampel_connect.clicked.connect(self.toggle_ampel_connection)
         ampel_layout.addWidget(self.btn_ampel_connect)
 
@@ -420,8 +479,7 @@ class MainWindow(QMainWindow):
         # Infozeile nur im Normalmodus (sonst zeigt die Editor-Zeile die Auswahl).
         self.lbl_ampel_target.setVisible(not editing)
         # Bearbeiten-Button optisch aktiv, solange der Modus laeuft.
-        self.btn_ampel_edit.setStyleSheet(
-            TRAMPOLIN_STYLE_ACTIVE if editing else "")
+        self.btn_ampel_edit.setStyleSheet(ICON_BUTTON_ACTIVE if editing else "")
 
     # ---- 6c3. Ampel: Infozeile "womit verbunden wird" aktualisieren ----
     def _update_ampel_target_label(self):
@@ -475,7 +533,7 @@ class MainWindow(QMainWindow):
         if not self._qira_connected:
             try:
                 self.client = QiraClient(
-                    url="ws://localhost:8081", logFcn=self.bridge.log_signal.emit,
+                    url=QIRA_URL, logFcn=self.bridge.log_signal.emit,
                     on_connection_changed=self.bridge.qira_connection_signal.emit)
                 # Bereits getroffene Trampolin-Auswahl auf den neuen Client uebertragen.
                 if self.selected_trampoline is not None:
@@ -749,6 +807,11 @@ if __name__ == "__main__":
         /* Labels erben sonst den Fenster-Hintergrund und wuerden auf farbigen
            Kacheln als dunkler Balken erscheinen. */
         QLabel { background: transparent; }
+        /* Dasselbe fuer Zeilen-Container INNERHALB einer Karte (Titelzeile,
+           IP-Zeile): ein nacktes QWidget malt sonst #121214 auf die Karte.
+           Bewusst per objectName, damit die Regel nicht auf Kinder durchschlaegt
+           und dem Icon-Button seinen Hintergrund nimmt. */
+        QWidget#panelRow { background: transparent; }
         QPushButton#primaryButton {
             background-color: #00B0FF; color: #ffffff; font-weight: bold;
             border-radius: 6px; padding: 10px 20px; font-size: 11pt; letter-spacing: 0.5px;
@@ -757,8 +820,10 @@ if __name__ == "__main__":
         QPushButton#primaryButton:disabled {
             background-color: #23252B; color: #5A5A62;
         }
+        /* Kleines Icon-Feld in der Titelzeile: padding klein halten, sonst bleibt
+           in den 28x28 px kein Platz mehr fuer das 16-px-Icon. */
         QPushButton#iconButton {
-            background-color: #3A3A3F; border: none; border-radius: 6px; padding: 8px;
+            background-color: #3A3A3F; border: none; border-radius: 6px; padding: 4px;
         }
         QPushButton#iconButton:hover { background-color: #4A4A50; }
         QLabel#mutedInfo { color: #8A8A90; font-size: 9pt; }
